@@ -9,7 +9,6 @@ import polars as pl
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModel
 
@@ -34,21 +33,6 @@ def get_device() -> str:
     logger.info("Using device: %s", device)
     return device
 
-
-class TokenizedDataset(Dataset):
-    def __init__(self, input_ids: Tensor, attention_mask: Tensor):
-        self.input_ids = input_ids
-        self.attention_mask = attention_mask
-
-    def __len__(self):
-        return self.input_ids.size(0)
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_mask[idx],
-        }
-    
 
 def last_token_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
     """"Extracts embeddings using last token pooling"""
@@ -142,45 +126,47 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
 
         input_ids = torch.from_numpy(pretokenized_data["input_ids"])
         attention_mask = torch.from_numpy(pretokenized_data["attention_mask"])
-    logger.info("Pre-tokenized data validated: %d items, sequence length %d", total_items, input_ids.shape[1])
+    logger.info("Pre-tokenized data validated: %d items, padded sequence length %d", total_items, input_ids.shape[1])
 
-    # Create dataset and dataloader
-    dataset = TokenizedDataset(input_ids, attention_mask)
 
-    num_workers = min(4, total_items)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,
-        prefetch_factor=2 if num_workers else None,
-        persistent_workers=num_workers > 0,
-    )
+    # items of similar real length together and trimming each batch down to
+    # only what it needs avoids paying for padding on every batch.
+    real_lengths = attention_mask.sum(dim=1)
+    length_percentiles = torch.quantile(real_lengths.float(), torch.tensor([0.5, 0.9, 0.99]))
     logger.info(
-        "Generating embeddings: batch_size=%d, num_workers=%d, embed_dim=%d",
-        BATCH_SIZE, num_workers, EMBED_DIM,
+        "Real token length: median=%d p90=%d p99=%d max=%d (padded to %d)",
+        length_percentiles[0], length_percentiles[1], length_percentiles[2],
+        real_lengths.max(), input_ids.shape[1],
     )
+    length_sorted_order = torch.argsort(real_lengths)
+
+    logger.info("Generating embeddings: batch_size=%d, embed_dim=%d", BATCH_SIZE, EMBED_DIM)
 
     #Pre-allocate output array
     all_embeddings = np.zeros((total_items, EMBED_DIM), dtype=np.float32)
 
-    current_idx = 0
     embed_start = time.perf_counter()
     with tqdm(total=total_items, desc="Generating Embeddings") as progress_bar:
-        for batch_idx, batch in enumerate(dataloader):
-            # Get batch size
-            batch_size = batch["input_ids"].size(0)
+        for batch_num, start in enumerate(range(0, total_items, BATCH_SIZE)):
+            batch_positions = length_sorted_order[start : start + BATCH_SIZE]
+            batch_max_len = int(real_lengths[batch_positions].max().item())
+
+            batch = {
+                "input_ids": input_ids[batch_positions, :batch_max_len],
+                "attention_mask": attention_mask[batch_positions, :batch_max_len],
+            }
 
             # Generate embeddings
             batch_embeddings = generate_embeddings(model, device, batch, EMBED_DIM)
 
-            # Write to pre-allocated array
-            all_embeddings[current_idx : current_idx + batch_size] = batch_embeddings
-            current_idx += batch_size
+            # Write to pre-allocated array at each item's original position
+            all_embeddings[batch_positions.numpy()] = batch_embeddings
 
-            logger.debug("Embedded batch %d (%d items, %d/%d total)", batch_idx + 1, batch_size, current_idx, total_items)
-            progress_bar.update(batch_size)
+            logger.debug(
+                "Embedded batch %d (%d items, trimmed to length %d)",
+                batch_num + 1, len(batch_positions), batch_max_len,
+            )
+            progress_bar.update(len(batch_positions))
 
     elapsed = time.perf_counter() - embed_start
     logger.info(
