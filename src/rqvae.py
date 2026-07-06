@@ -1,3 +1,5 @@
+import time
+
 from torch import nn
 from torch.nn import functional as F
 from encoder import MLP
@@ -8,6 +10,9 @@ from sklearn.cluster import KMeans
 import torch
 
 from config import RQVAEConfig
+from logger import Logger
+
+logger = Logger.get_logger(__name__)
 
 __all__ = ["RQVAEConfig", "RQVAE"]
 
@@ -40,6 +45,13 @@ class RQVAE(nn.Module):
         # Quantization Layers
         self.vq_layers = nn.ModuleList([VectorQuantizer(config) for _ in range(self.codebook_quantization_levels)])
 
+        n_params = sum(p.numel() for p in self.parameters())
+        logger.info(
+            "RQVAE initialized: %d -> %d (levels=%d, codebook_size=%d each), %d total parameters",
+            self.item_embedding_dim, self.codebook_embedding_dim, self.codebook_quantization_levels,
+            self.codebook_size, n_params,
+        )
+
     def encode(self, x: Tensor) -> Tensor:
         return self.encoder(x)
 
@@ -55,11 +67,13 @@ class RQVAE(nn.Module):
         residual = z
 
         all_indices = []
+        level_residuals = []  # Input residual to each level, before quantization (for codebook resets)
         vq_loss = 0
         codebook_losses = []
         commitment_losses = []
 
         for vq_layer in self.vq_layers:
+            level_residuals.append(residual)
             vq_output = vq_layer(residual)  # Quantize current residual
             residual = residual - vq_output.quantized.detach()  # Update residual for next level
             quantized_out = quantized_out + vq_output.quantized_st  # Accumulate quantized vectors
@@ -74,6 +88,12 @@ class RQVAE(nn.Module):
         recon_loss = F.mse_loss(x_recon, x)  # Reconstruction loss
         loss = recon_loss + vq_loss  # Total loss
 
+        logger.debug(
+            "RQVAE forward: batch=%d, loss=%.4f, recon_loss=%.4f, vq_loss=%.4f",
+            x.shape[0], loss.item(), recon_loss.item(),
+            vq_loss.item() if isinstance(vq_loss, Tensor) else vq_loss,
+        )
+
         loss_dict = {
             "loss": loss,
             "recon_loss": recon_loss,
@@ -82,6 +102,7 @@ class RQVAE(nn.Module):
             "commitment_losses": commitment_losses,  # List of losses per level
             "indices": all_indices,  # Store for metric computation
             "residual": residual,  # Store for residual norm calculation
+            "level_residuals": level_residuals,  # Per-level input, for codebook resets
         }
 
         return x_recon, all_indices, loss_dict
@@ -100,6 +121,7 @@ class RQVAE(nn.Module):
 
             # Stack indices from all levels
             semantic_ids = torch.stack(indices_list, dim=-1)
+        logger.info("Encoded %d items to semantic IDs (shape=%s)", x.shape[0], tuple(semantic_ids.shape))
         return semantic_ids
 
     def decode_from_semantic_ids(self, semantic_ids: Tensor) -> Tensor:
@@ -112,7 +134,9 @@ class RQVAE(nn.Module):
                 codes = self.vq_layers[level].embedding(indices)
                 quantized_sum += codes
 
-            return self.decode(quantized_sum)
+            decoded = self.decode(quantized_sum)
+        logger.debug("Decoded %d semantic IDs back to embedding space", semantic_ids.shape[0])
+        return decoded
 
     def calculate_unique_ids_proportion(self, semantic_ids: Tensor) -> float:
         """Calculate proportion of unique semantic IDs in a batch.
@@ -173,6 +197,12 @@ class RQVAE(nn.Module):
             first_batch = first_batch[0]
         first_batch = first_batch.to(device)
 
+        logger.info(
+            "Starting k-means codebook initialization: %d levels, %d clusters/level, %d samples",
+            self.codebook_quantization_levels, self.codebook_size, first_batch.shape[0],
+        )
+        init_start = time.perf_counter()
+
         # Encode to latent space
         with torch.no_grad():
             z = self.encode(first_batch)
@@ -180,6 +210,7 @@ class RQVAE(nn.Module):
             # Initialize each level's codebook
             residual = z
             for level, vq_layer in enumerate(self.vq_layers):
+                level_start = time.perf_counter()
                 residual_np = residual.cpu().numpy().reshape(-1, self.codebook_embedding_dim)  # Flatten for k-means
 
                 kmeans = KMeans(n_clusters=self.codebook_size, n_init=10, random_state=0)
@@ -189,6 +220,13 @@ class RQVAE(nn.Module):
                 # model's (float32) dtype, or later matmuls/cdist calls fail.
                 vq_layer.embedding.weight.data = torch.from_numpy(kmeans.cluster_centers_).float().to(device)
 
+                logger.info(
+                    "K-means init level %d/%d done in %.1fs (inertia=%.4f)",
+                    level + 1, self.codebook_quantization_levels, time.perf_counter() - level_start, kmeans.inertia_,
+                )
+
                 if level < self.codebook_quantization_levels - 1:  # Compute next residual
                     _, quantized = vq_layer.quantize(residual)
                     residual = residual - quantized
+
+        logger.info("K-means codebook initialization complete in %.1fs", time.perf_counter() - init_start)

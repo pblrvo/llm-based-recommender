@@ -2,6 +2,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from logger import Logger
+
+logger = Logger.get_logger(__name__)
+
 
 @dataclass
 class RQVAEConfig:
@@ -40,3 +44,21 @@ class RQVAEConfig:
         # Auto-generate embeddings path if not provided
         if self.embeddings_path is None:
             self.embeddings_path = self.data_dir / "output" / "games_with_embeddings.parquet"
+            logger.info("embeddings_path not set, defaulting to %s", self.embeddings_path)
+
+        if self.scheduler_type not in ("cosine", "cosine_with_warmup"):
+            raise ValueError(f"Unknown scheduler_type: {self.scheduler_type!r}")
+
+        logger.info(
+            "RQVAEConfig: item_dim=%d, encoder_hidden_dims=%s, codebook_dim=%d, "
+            "levels=%d, codebook_size=%d, normalize=%s, commitment_weight=%.3f",
+            self.item_embedding_dim, self.encoder_hidden_dims, self.codebook_embedding_dim,
+            self.codebook_quantization_levels, self.codebook_size, self.codebook_normalize,
+            self.commitment_weight,
+        )
+        logger.info(
+            "RQVAEConfig: batch_size=%d, num_epochs=%d, scheduler=%s, max_lr=%.2e, min_lr=%.2e, "
+            "warmup_steps=%d",
+            self.batch_size, self.num_epochs, self.scheduler_type, self.max_lr, self.min_lr,
+            self.warmup_steps,
+        )

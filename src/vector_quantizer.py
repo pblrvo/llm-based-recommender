@@ -6,6 +6,9 @@ from torch import Tensor
 import torch
 
 from config import RQVAEConfig
+from logger import Logger
+
+logger = Logger.get_logger(__name__)
 
 
 class QuantizationOutput(NamedTuple):
@@ -32,6 +35,11 @@ class VectorQuantizer(nn.Module):
         # Track codebook usage
         self.register_buffer("usage_count", torch.zeros(self.codebook_size))
         self.register_buffer("update_count", torch.tensor(0))
+
+        logger.info(
+            "VectorQuantizer initialized: codebook_size=%d, codebook_dim=%d, commitment_weight=%.3f",
+            self.codebook_size, self.codebook_embedding_dim, self.commitment_weight,
+        )
 
     @staticmethod
     def safe_div(num: Tensor, den: Tensor, eps: float = 1e-6) -> Tensor:
@@ -152,6 +160,11 @@ class VectorQuantizer(nn.Module):
         if self.training:
             self.update_usage(indices)
 
+        logger.debug(
+            "VQ forward: batch=%d, codebook_loss=%.4f, commitment_loss=%.4f, loss=%.4f",
+            x.shape[0], codebook_loss.item(), commitment_loss.item(), loss.item(),
+        )
+
         return QuantizationOutput(
             quantized_st=quantized_st,
             quantized=quantized,
@@ -175,6 +188,15 @@ class VectorQuantizer(nn.Module):
                 # Sample random vectors from batch
                 random_indices = torch.randperm(batch_flat.shape[0], device=batch_flat.device)[: len(unused_indices)]
                 self.embedding.weight.data[unused_indices] = batch_flat[random_indices].detach()
+                logger.info(
+                    "Reset %d/%d unused codebook vectors from batch samples",
+                    len(unused_indices), self.codebook_size,
+                )
+            else:
+                logger.warning(
+                    "Skipped codebook reset: %d unused codes but only %d batch samples available",
+                    len(unused_indices), batch_flat.shape[0],
+                )
 
         # Reset usage count after replacement
         self.reset_usage_count()
