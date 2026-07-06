@@ -28,12 +28,14 @@ class SemanticIdExporter:
         output_path: Path = None,
         device: str = None,
         batch_size: int = None,
+        disambiguate_collisions: bool = True,
     ):
         self.config = config
         self.checkpoint_path = Path(checkpoint_path)
         self.output_path = Path(output_path) if output_path else config.data_dir / "output" / "semantic_ids.parquet"
         self.device = device or get_device()
         self.batch_size = batch_size or config.batch_size
+        self.disambiguate_collisions = disambiguate_collisions
 
     def load_model(self) -> RQVAE:
         if not self.checkpoint_path.exists():
@@ -99,12 +101,49 @@ class SemanticIdExporter:
 
         return n_colliding_items
 
+    def add_collision_digit(self, semantic_ids: np.ndarray) -> np.ndarray:
+        """Appends a disambiguation digit for items that share a semantic ID.
+
+        Within each colliding group (items with identical values across all
+        quantization levels), items are numbered 0, 1, 2, ... in their
+        original order. This guarantees every row's full ID (levels +
+        disambiguator) is unique, at the cost of one extra token per item.
+        """
+        n = semantic_ids.shape[0]
+        disambiguator = np.zeros(n, dtype=semantic_ids.dtype)
+        seen_counts = {}
+        for i in range(n):
+            key = tuple(semantic_ids[i].tolist())
+            count = seen_counts.get(key, 0)
+            disambiguator[i] = count
+            seen_counts[key] = count + 1
+
+        max_digit = int(disambiguator.max())
+        if max_digit > 0:
+            logger.info(
+                "Added collision-disambiguation digit: values 0-%d (largest colliding group has %d items)",
+                max_digit, max_digit + 1,
+            )
+        else:
+            logger.info("Added collision-disambiguation digit: no collisions, all values are 0")
+
+        return np.concatenate([semantic_ids, disambiguator[:, None]], axis=1)
+
     def export(self) -> pl.DataFrame:
         model = self.load_model()
         ids, embeddings = self.load_items()
         semantic_ids = self.encode_all(model, embeddings)
 
         self.report_collisions(semantic_ids)
+
+        if self.disambiguate_collisions:
+            semantic_ids = self.add_collision_digit(semantic_ids)
+            remaining = self.report_collisions(semantic_ids)
+            if remaining > 0:
+                logger.error(
+                    "%d items still collide after adding the disambiguation digit - this should not happen",
+                    remaining,
+                )
 
         result_df = pl.DataFrame({"id": ids, "semantic_ids": semantic_ids.tolist()})
         for level in range(semantic_ids.shape[1]):
