@@ -1,8 +1,14 @@
 import os
+import sys
 import time
 from pathlib import Path
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Reduces allocator fragmentation from the widely varying batch sizes/shapes
+# produced by length-bucketed batching (see PyTorch's own OOM error message).
+# Not supported on Windows (CUDAAllocatorConfig warns and ignores it there).
+if sys.platform != "win32":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import polars as pl
@@ -19,6 +25,16 @@ DATA_DIR = Path("data")
 MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 BATCH_SIZE = 64
 EMBED_DIM = 1024
+
+# Batch size is scaled down for longer sequences since attention memory grows
+# roughly with sequence length squared; BATCH_SIZE is only safe up to
+# REFERENCE_SEQ_LEN tokens.
+REFERENCE_SEQ_LEN = 512
+
+# How often (in seconds) to persist progress to disk. Embedding the full
+# catalog takes hours; without checkpoints, a crash near the end (e.g. an
+# OOM on the last few long-sequence batches) throws away everything.
+CHECKPOINT_INTERVAL_SECONDS = 300
 
 logger = Logger.get_logger(__name__)
 
@@ -51,7 +67,7 @@ def generate_embeddings(
         pretokenized_batch: dict,
         target_dim = 1024,
 ) -> np.ndarray:
-    
+
     # Move to device
     encoded = {k: v.to(device) for k, v in pretokenized_batch.items()}
 
@@ -70,6 +86,64 @@ def generate_embeddings(
         embeddings = F.normalize(embeddings, p=2, dim=1)
 
     return embeddings.float().cpu().numpy()
+
+
+def generate_embeddings_with_oom_retry(model, device, batch: dict, target_dim: int) -> np.ndarray:
+    """Runs generate_embeddings, halving the batch and retrying on CUDA OOM.
+
+    Safety net for cases where the adaptive batch size (calibrated on
+    REFERENCE_SEQ_LEN) still doesn't fit for a particular batch/GPU.
+    """
+    batch_size = batch["input_ids"].size(0)
+    try:
+        return generate_embeddings(model, device, batch, target_dim)
+    except torch.OutOfMemoryError:
+        if batch_size == 1:
+            raise
+        seq_len = batch["input_ids"].size(1)
+        logger.warning(
+            "CUDA OOM at batch_size=%d, seq_len=%d; freeing cache and retrying as two smaller batches",
+            batch_size, seq_len,
+        )
+        torch.cuda.empty_cache()
+        mid = batch_size // 2
+        first_half = {k: v[:mid] for k, v in batch.items()}
+        second_half = {k: v[mid:] for k, v in batch.items()}
+        return np.concatenate([
+            generate_embeddings_with_oom_retry(model, device, first_half, target_dim),
+            generate_embeddings_with_oom_retry(model, device, second_half, target_dim),
+        ])
+
+
+def adaptive_batch_size(seq_len: int, base_batch_size: int = BATCH_SIZE, reference_len: int = REFERENCE_SEQ_LEN) -> int:
+    """Shrinks batch size for longer sequences (attention memory grows ~seq_len^2)."""
+    if seq_len <= reference_len:
+        return base_batch_size
+    scale = (reference_len / seq_len) ** 2
+    return max(1, int(base_batch_size * scale))
+
+
+def _load_checkpoint(checkpoint_path: Path, total_items: int):
+    if not checkpoint_path.exists():
+        return None
+    with np.load(checkpoint_path) as ckpt:
+        if int(ckpt["n_items"]) != total_items:
+            logger.warning(
+                "Checkpoint item count (%d) doesn't match current catalog (%d); ignoring checkpoint",
+                int(ckpt["n_items"]), total_items,
+            )
+            return None
+        return ckpt["embeddings"].copy(), ckpt["filled"].copy()
+
+
+def _save_checkpoint(checkpoint_path: Path, embeddings: np.ndarray, filled: np.ndarray, total_items: int):
+    # Write to a temp file and rename, so a crash mid-write can't corrupt
+    # the last good checkpoint.
+    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    with open(tmp_path, "wb") as f:
+        np.savez(f, embeddings=embeddings, filled=filled, n_items=total_items)
+    tmp_path.replace(checkpoint_path)
+    logger.info("Checkpoint saved: %d/%d items complete", int(filled.sum()), total_items)
 
 def embed_items(input_path: Path = None, output_path: Path = None, tokenized_path: Path = None, limit: int = None):
     device = get_device()
@@ -128,9 +202,8 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
         attention_mask = torch.from_numpy(pretokenized_data["attention_mask"])
     logger.info("Pre-tokenized data validated: %d items, padded sequence length %d", total_items, input_ids.shape[1])
 
-
-    # items of similar real length together and trimming each batch down to
-    # only what it needs avoids paying for padding on every batch.
+    # batching items of similar real length together and trimming each batch
+    # down to only what it needs avoids paying for padding on every batch.
     real_lengths = attention_mask.sum(dim=1)
     length_percentiles = torch.quantile(real_lengths.float(), torch.tensor([0.5, 0.9, 0.99]))
     logger.info(
@@ -138,17 +211,32 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
         length_percentiles[0], length_percentiles[1], length_percentiles[2],
         real_lengths.max(), input_ids.shape[1],
     )
-    length_sorted_order = torch.argsort(real_lengths)
 
-    logger.info("Generating embeddings: batch_size=%d, embed_dim=%d", BATCH_SIZE, EMBED_DIM)
+    # Resume from a checkpoint if one exists (e.g. a previous run crashed).
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_path.parent / f"{output_path.stem}.checkpoint.npz"
+    checkpoint = _load_checkpoint(checkpoint_path, total_items)
+    if checkpoint is not None:
+        all_embeddings, filled = checkpoint
+        logger.info("Resuming from checkpoint: %d/%d items already embedded", int(filled.sum()), total_items)
+    else:
+        all_embeddings = np.zeros((total_items, EMBED_DIM), dtype=np.float32)
+        filled = np.zeros(total_items, dtype=bool)
 
-    #Pre-allocate output array
-    all_embeddings = np.zeros((total_items, EMBED_DIM), dtype=np.float32)
+    remaining_positions = torch.from_numpy(np.flatnonzero(~filled))
+    length_sorted_order = remaining_positions[torch.argsort(real_lengths[remaining_positions])]
+
+    logger.info("Generating embeddings: base_batch_size=%d, embed_dim=%d", BATCH_SIZE, EMBED_DIM)
 
     embed_start = time.perf_counter()
-    with tqdm(total=total_items, desc="Generating Embeddings") as progress_bar:
-        for batch_num, start in enumerate(range(0, total_items, BATCH_SIZE)):
-            batch_positions = length_sorted_order[start : start + BATCH_SIZE]
+    last_checkpoint_time = embed_start
+    with tqdm(total=total_items, initial=int(filled.sum()), desc="Generating Embeddings") as progress_bar:
+        position = 0
+        batch_num = 0
+        while position < len(length_sorted_order):
+            current_len = int(real_lengths[length_sorted_order[position]].item())
+            current_batch_size = adaptive_batch_size(current_len)
+            batch_positions = length_sorted_order[position : position + current_batch_size]
             batch_max_len = int(real_lengths[batch_positions].max().item())
 
             batch = {
@@ -157,16 +245,24 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
             }
 
             # Generate embeddings
-            batch_embeddings = generate_embeddings(model, device, batch, EMBED_DIM)
+            batch_embeddings = generate_embeddings_with_oom_retry(model, device, batch, EMBED_DIM)
 
             # Write to pre-allocated array at each item's original position
-            all_embeddings[batch_positions.numpy()] = batch_embeddings
+            position_indices = batch_positions.numpy()
+            all_embeddings[position_indices] = batch_embeddings
+            filled[position_indices] = True
 
+            batch_num += 1
             logger.debug(
-                "Embedded batch %d (%d items, trimmed to length %d)",
-                batch_num + 1, len(batch_positions), batch_max_len,
+                "Embedded batch %d (%d items, batch_size=%d, trimmed to length %d)",
+                batch_num, len(batch_positions), current_batch_size, batch_max_len,
             )
             progress_bar.update(len(batch_positions))
+            position += len(batch_positions)
+
+            if time.perf_counter() - last_checkpoint_time > CHECKPOINT_INTERVAL_SECONDS:
+                _save_checkpoint(checkpoint_path, all_embeddings, filled, total_items)
+                last_checkpoint_time = time.perf_counter()
 
     elapsed = time.perf_counter() - embed_start
     logger.info(
@@ -178,9 +274,10 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
     embeddings_list = all_embeddings.tolist()
     items_df_with_emb = item_df.with_columns(pl.Series("embedding", embeddings_list, dtype=pl.List(pl.Float32)))
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     items_df_with_emb.write_parquet(output_path)
     logger.info("Saved embeddings dataset to %s", output_path)
+
+    checkpoint_path.unlink(missing_ok=True)
 
     return items_df_with_emb
 
