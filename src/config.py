@@ -19,8 +19,8 @@ class RQVAEConfig:
     codebook_embedding_dim: int = 32  # Dimension of codebook vectors
     codebook_quantization_levels: int = 3  # Number of hierarchical levels
     codebook_size: int = 256  # Number of codes per codebook
-    codebook_normalize: bool = True  # L2-normalize encoder output before quantization
-    commitment_weight: float = 0.25  # Commitment loss weight (beta)
+    codebook_normalize: bool = False  # L2-normalize encoder output before quantization
+    commitment_weight: float = 0.1  # Commitment loss weight (beta)
 
     # Training parameters
     batch_size: int = 32768  # Batch size for training
@@ -37,6 +37,7 @@ class RQVAEConfig:
     reset_unused_codes: bool = True  # Reset unused codebook codes during training
     steps_per_codebook_reset: int = 2  # Reset unused codebook codes every N steps (breaks if set to 1)
     codebook_usage_threshold: float = 1.0  # Only reset if usage falls below this proportion (0-1)
+    codebook_dominance_threshold: float = 0.5  # Also reset a code if it claims more than this share of usage
     val_split: float = 0.05  # Validation set split ratio
 
     def __post_init__(self):
@@ -61,4 +62,10 @@ class RQVAEConfig:
             "warmup_steps=%d",
             self.batch_size, self.num_epochs, self.scheduler_type, self.max_lr, self.min_lr,
             self.warmup_steps,
+        )
+        logger.info(
+            "RQVAEConfig: reset_unused_codes=%s, steps_per_codebook_reset=%d, "
+            "codebook_usage_threshold=%.2f, codebook_dominance_threshold=%.2f",
+            self.reset_unused_codes, self.steps_per_codebook_reset,
+            self.codebook_usage_threshold, self.codebook_dominance_threshold,
         )

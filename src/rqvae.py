@@ -178,6 +178,15 @@ class RQVAE(nn.Module):
         """
         return [vq_layer.get_usage_rate() for vq_layer in self.vq_layers]
 
+    def calculate_codebook_max_share(self) -> List[float]:
+        """Get the single most-used code's share of usage for each level.
+
+        Unlike calculate_codebook_usage(), this catches index collapse where
+        one code dominates while the rest are technically "used" at least
+        once. Close to 1/codebook_size is healthy; close to 1.0 is collapse.
+        """
+        return [vq_layer.get_max_usage_share() for vq_layer in self.vq_layers]
+
     def calculate_avg_residual_norm(self, residual: Tensor) -> float:
         """Calculate average residual norm after quantization.
 

@@ -138,6 +138,19 @@ class VectorQuantizer(nn.Module):
             return 0.0
         return (self.usage_count > 0).float().mean().item()
 
+    def get_max_usage_share(self) -> float:
+        """Fraction of all usage claimed by the single most-used code.
+
+        A healthy, well-distributed codebook keeps this close to 1/codebook_size.
+        A value near 1.0 means one code is doing almost all the work (index
+        collapse) even though get_usage_rate() may still look fine, since that
+        only checks whether codes were used *at all*, not how evenly.
+        """
+        total = self.usage_count.sum()
+        if total == 0:
+            return 0.0
+        return (self.usage_count.max() / total).item()
+
     def reset_usage_count(self):
         """Reset usage count (useful for periodic resets)."""
         self.usage_count.zero_()
@@ -174,28 +187,50 @@ class VectorQuantizer(nn.Module):
             commitment_loss=commitment_loss,
         )
 
-    def reset_unused_codebook_vectors(self, batch_data: Tensor):
-        """Reset unused codebook vectors to random values."""
+    def reset_unused_codebook_vectors(self, batch_data: Tensor, dominance_threshold: float = None):
+        """Reset codebook vectors that are dead (zero usage) or over-dominant
+        (claiming a disproportionate share of usage).
+
+        Index collapse can happen either way: a code nobody picks is wasted
+        capacity, but so is a code that ends up serving almost every input
+        while the rest of the codebook goes idle — the latter is invisible to
+        get_usage_rate() (that code still counts as "used"), so it needs its
+        own check via dominance_threshold.
+
+        Args:
+            batch_data: current batch's residual at this level, used as a
+                source of fresh vectors for whichever codes get reset.
+            dominance_threshold: if a code's share of usage exceeds this
+                (0-1), it is reset too. None or >=1.0 disables this check.
+        """
         if self.update_count == 0:
             return
 
-        # Find codes with zero usage
+        # Dead codes: never picked at all.
         unused_indices = (self.usage_count == 0).nonzero().squeeze(-1)
 
-        if len(unused_indices) > 0:
+        # Over-dominant codes: picked far more than a fair share.
+        dominant_indices = unused_indices.new_empty(0)
+        total_usage = self.usage_count.sum()
+        if dominance_threshold is not None and dominance_threshold < 1.0 and total_usage > 0:
+            dominant_indices = (self.usage_count / total_usage > dominance_threshold).nonzero().squeeze(-1)
+
+        reset_indices = torch.unique(torch.cat([unused_indices, dominant_indices]))
+
+        if len(reset_indices) > 0:
             batch_flat = batch_data.reshape(-1, self.codebook_embedding_dim)
-            if batch_flat.shape[0] >= len(unused_indices):
+            if batch_flat.shape[0] >= len(reset_indices):
                 # Sample random vectors from batch
-                random_indices = torch.randperm(batch_flat.shape[0], device=batch_flat.device)[: len(unused_indices)]
-                self.embedding.weight.data[unused_indices] = batch_flat[random_indices].detach()
+                random_indices = torch.randperm(batch_flat.shape[0], device=batch_flat.device)[: len(reset_indices)]
+                self.embedding.weight.data[reset_indices] = batch_flat[random_indices].detach()
                 logger.info(
-                    "Reset %d/%d unused codebook vectors from batch samples",
-                    len(unused_indices), self.codebook_size,
+                    "Reset %d/%d codebook vectors from batch samples (%d dead, %d over-dominant)",
+                    len(reset_indices), self.codebook_size, len(unused_indices), len(dominant_indices),
                 )
             else:
                 logger.warning(
-                    "Skipped codebook reset: %d unused codes but only %d batch samples available",
-                    len(unused_indices), batch_flat.shape[0],
+                    "Skipped codebook reset: %d codes need resetting but only %d batch samples available",
+                    len(reset_indices), batch_flat.shape[0],
                 )
 
         # Reset usage count after replacement

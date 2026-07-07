@@ -145,8 +145,11 @@ class RQVAETrainer:
     def _maybe_reset_dead_codes(self, level_residuals: list):
         for level, vq_layer in enumerate(self.model.vq_layers):
             usage_rate = vq_layer.get_usage_rate()
-            if usage_rate < self.config.codebook_usage_threshold:
-                vq_layer.reset_unused_codebook_vectors(level_residuals[level])
+            max_share = vq_layer.get_max_usage_share()
+            if usage_rate < self.config.codebook_usage_threshold or max_share > self.config.codebook_dominance_threshold:
+                vq_layer.reset_unused_codebook_vectors(
+                    level_residuals[level], dominance_threshold=self.config.codebook_dominance_threshold
+                )
 
     @torch.no_grad()
     def validate(self) -> dict:
@@ -180,6 +183,7 @@ class RQVAETrainer:
             "codebook_losses": [l.item() for l in loss_dict["codebook_losses"]],
             "commitment_losses": [l.item() for l in loss_dict["commitment_losses"]],
             "codebook_usage": self.model.calculate_codebook_usage(),
+            "codebook_max_share": self.model.calculate_codebook_max_share(),
             "unique_ids_proportion": self.model.calculate_unique_ids_proportion(semantic_ids),
             "avg_residual_norm": self.model.calculate_avg_residual_norm(loss_dict["residual"]),
         }
@@ -208,6 +212,8 @@ class RQVAETrainer:
             w.add_scalar(f"{prefix}/commitment_loss/level_{level}", cm_loss, self.global_step)
         for level, usage in enumerate(metrics.get("codebook_usage", [])):
             w.add_scalar(f"{prefix}/codebook_usage/level_{level}", usage, self.global_step)
+        for level, max_share in enumerate(metrics.get("codebook_max_share", [])):
+            w.add_scalar(f"{prefix}/codebook_max_share/level_{level}", max_share, self.global_step)
 
         if "grad_norm" in metrics:
             w.add_scalar("train/grad_norm", metrics["grad_norm"], self.global_step)
