@@ -1,8 +1,10 @@
 """Unit tests for the pure-logic pieces of constrained_decoding.py: the
 Trie, semantic-ID/description formatting, sid-code parsing, hierarchical
-prefix-accuracy scoring, and the prefix_allowed_tokens_fn used to drive
-constrained generation. No model, tokenizer download, or GPU required."""
+prefix-accuracy scoring, Recall@K/NDCG@K, and the prefix_allowed_tokens_fn
+used to drive constrained generation. No model, tokenizer download, or GPU
+required."""
 
+import math
 import sys
 from pathlib import Path
 
@@ -19,7 +21,9 @@ from constrained_decoding import (
     hierarchical_match,
     item_description,
     make_prefix_allowed_tokens_fn,
+    ndcg_at_k,
     parse_sid_codes,
+    recall_at_k,
     semantic_id_to_tokens,
 )
 
@@ -242,3 +246,55 @@ def test_build_name_trie_accepts_every_catalog_description(tiny_catalog):
         token_ids = tokenizer(desc)["input_ids"]
         node = trie.children_of(token_ids)
         assert node is not None and Trie.END in node
+
+
+# ---------------------------------------------------------------------
+# recall_at_k / ndcg_at_k
+# ---------------------------------------------------------------------
+
+
+def test_recall_at_k_hit_within_k():
+    assert recall_at_k(["a", "b", "c"], "b", k=3) == 1.0
+
+
+def test_recall_at_k_miss_outside_k():
+    assert recall_at_k(["a", "b", "c", "target"], "target", k=3) == 0.0
+
+
+def test_recall_at_k_miss_not_present_at_all():
+    assert recall_at_k(["a", "b", "c"], "target", k=10) == 0.0
+
+
+def test_recall_at_k_handles_fewer_candidates_than_k():
+    assert recall_at_k(["a"], "a", k=10) == 1.0
+    assert recall_at_k(["a"], "b", k=10) == 0.0
+
+
+def test_recall_at_k_hit_exactly_at_boundary():
+    # target is the k-th candidate (index k-1) -- must still count as a hit.
+    assert recall_at_k(["a", "b", "c"], "c", k=3) == 1.0
+    assert recall_at_k(["a", "b", "c", "d"], "d", k=3) == 0.0  # one past the boundary
+
+
+def test_ndcg_at_k_rank_1_is_perfect_score():
+    assert ndcg_at_k(["target", "b", "c"], "target", k=3) == pytest.approx(1.0)
+
+
+def test_ndcg_at_k_decreases_with_rank():
+    ndcg_rank_1 = ndcg_at_k(["target", "b", "c"], "target", k=3)
+    ndcg_rank_2 = ndcg_at_k(["a", "target", "c"], "target", k=3)
+    ndcg_rank_3 = ndcg_at_k(["a", "b", "target"], "target", k=3)
+    assert ndcg_rank_1 > ndcg_rank_2 > ndcg_rank_3 > 0
+
+
+def test_ndcg_at_k_matches_log2_formula_at_each_rank():
+    candidates = ["a", "b", "target", "d"]
+    assert ndcg_at_k(candidates, "target", k=4) == pytest.approx(1 / math.log2(3 + 1))
+
+
+def test_ndcg_at_k_zero_when_outside_k():
+    assert ndcg_at_k(["a", "b", "c", "target"], "target", k=2) == 0.0
+
+
+def test_ndcg_at_k_zero_when_absent():
+    assert ndcg_at_k(["a", "b", "c"], "target", k=3) == 0.0

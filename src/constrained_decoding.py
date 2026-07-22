@@ -20,6 +20,7 @@ match -- since pure exact-match can't distinguish "got the coarse cluster
 right, missed the last digit" from "got nothing right."
 """
 
+import math
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -169,6 +170,54 @@ def constrained_generate(
     return tokenizer.decode(new_tokens, skip_special_tokens=False).replace(tokenizer.eos_token, "").strip()
 
 
+@torch.no_grad()
+def constrained_beam_search(
+    model, tokenizer, prompt: str, trie: Trie, num_beams: int, max_new_tokens: int = 32,
+    temperature: Optional[float] = None,
+) -> List[str]:
+    """Like `constrained_generate`, but returns `num_beams` candidate
+    completions via beam search instead of one greedy/sampled completion --
+    the ranking equivalent of a classic recommender's top-K scored items,
+    since a single greedy decode is a top-1 prediction, not a ranking.
+    Ordered best-first (beam score). Used for Recall@K/NDCG@K, computed the
+    same way as TIGER (Rajput et al. 2023) and LC-Rec evaluate semantic-ID
+    generative recommenders: constrained beam search standing in for the
+    ranking step a traditional model gets from a dot-product over all
+    items.
+
+    Deterministic beam search by default; pass `temperature` to switch to
+    beam-search multinomial sampling (each beam samples from the
+    temperature-scaled distribution instead of always expanding the
+    highest-probability continuations) -- trades some ranking precision for
+    beam diversity, which matters when deterministic beam search's beams
+    tend to collapse onto near-identical high-probability variants of the
+    same prefix rather than covering genuinely different candidates."""
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_len = inputs["input_ids"].shape[1]
+    allowed_fn = make_prefix_allowed_tokens_fn(trie, prompt_len, tokenizer.eos_token_id)
+
+    sampling_kwargs = {"do_sample": False}
+    if temperature is not None:
+        sampling_kwargs = {"do_sample": True, "temperature": temperature}
+
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        num_beams=num_beams,
+        num_return_sequences=num_beams,
+        prefix_allowed_tokens_fn=allowed_fn,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        early_stopping=True,
+        **sampling_kwargs,
+    )
+    completions = []
+    for seq in output_ids:
+        new_tokens = seq[prompt_len:]
+        completions.append(tokenizer.decode(new_tokens, skip_special_tokens=False).replace(tokenizer.eos_token, "").strip())
+    return completions
+
+
 _SID_LEVEL_TOKEN = re.compile(r"<\|sid_L(\d)_(\d+)\|>")
 
 
@@ -201,3 +250,24 @@ def hierarchical_match(predicted: str, expected: str) -> Dict[str, bool]:
     result["l012"] = pred_codes[:3] == exp_codes[:3]
     result["l0123"] = pred_codes == exp_codes
     return result
+
+
+def recall_at_k(candidates: List[str], target: str, k: int) -> float:
+    """1.0 if `target` appears among the top-`k` `candidates` (ordered
+    best-first, e.g. by beam score), else 0.0. `candidates` may have fewer
+    than k entries (e.g. beam search returned fewer valid completions than
+    requested) -- treated as-is, no padding needed since membership doesn't
+    depend on length."""
+    return 1.0 if target in candidates[:k] else 0.0
+
+
+def ndcg_at_k(candidates: List[str], target: str, k: int) -> float:
+    """Binary-relevance NDCG@k: 1/log2(rank+1) if `target` is within the
+    top-k of `candidates` (rank is 1-indexed), else 0.0. With exactly one
+    relevant item per query, the ideal DCG is always 1 (a single relevant
+    item at rank 1), so this reduces to plain DCG@k."""
+    top_k = candidates[:k]
+    if target not in top_k:
+        return 0.0
+    rank = top_k.index(target) + 1
+    return 1.0 / math.log2(rank + 1)
