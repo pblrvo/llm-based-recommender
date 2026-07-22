@@ -1,4 +1,4 @@
-# hybrid-recommender-system
+# LLM-based Recommender System
 
 A generative recommender pipeline: game catalog items are embedded, compressed into short
 **semantic IDs** via an RQ-VAE, and those semantic IDs become a vocabulary an LLM (Qwen3) is
