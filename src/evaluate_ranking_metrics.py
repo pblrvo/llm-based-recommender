@@ -115,7 +115,7 @@ def evaluate_task(
 
 
 def run(
-    adapter_path: Path, project_root: Path, n: int = 20, seed: int = 0, temperature: Optional[float] = None,
+    adapter_path: Path, project_root: Path, n: int = 500, seed: int = 0, temperature: Optional[float] = None,
 ) -> Dict[str, Dict[int, Dict[str, float]]]:
     val_path = project_root / "data" / "output" / "sft_val.jsonl"
     model, tokenizer = load_model(adapter_path)
@@ -158,7 +158,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-n", type=int, default=20, help="Examples sampled per task (default: 20)")
+    parser.add_argument("-n", type=int, default=500, help="Examples sampled per task (default: 500)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--temperature", type=float, default=None,

@@ -1,10 +1,12 @@
-# Core ML / tensor stack.
-# torch needs a CUDA-enabled build for the embedding/RQ-VAE/fine-tuning
-# stages (see README's Setup section) -- the default PyPI wheel is CPU-only.
-# Install it explicitly first, e.g. for CUDA 12.6:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu126
-# then install the rest of this file.
-torch==2.13.0
+# Install order matters here -- see the bottom of this file for why unsloth
+# isn't installed via a plain `pip install -r requirements.txt`.
+#
+# 1. torch needs a CUDA-enabled build for the embedding/RQ-VAE/fine-tuning
+#    stages (see README's Setup section) -- the default PyPI wheel is
+#    CPU-only. Install it explicitly first, e.g. for CUDA 12.6:
+#      pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu126
+# 2. pip install -r requirements.txt        (everything below this point)
+# 3. pip install unsloth==2026.7.2 --no-deps   (see note at the bottom)
 
 # RQ-VAE pipeline (encoder/vector_quantizer/rqvae, train_rqvae.py)
 numpy==2.5.1
@@ -13,11 +15,10 @@ scikit-learn==1.9.0
 tqdm==4.68.3
 matplotlib==3.11.0
 
-# LLM fine-tuning pipeline (warmup_embeddings.py, qlora_finetune.py):
-# Unsloth patches transformers/trl/peft at import time, so those three plus
-# bitsandbytes (4-bit quantized loading) are required alongside it, not just
-# pulled in transitively.
-unsloth==2026.7.2
+# LLM fine-tuning pipeline (warmup_embeddings.py, qlora_finetune.py).
+# unsloth itself is intentionally NOT listed here -- see note at the bottom.
+# These are its real runtime dependencies, installed directly so `--no-deps`
+# on unsloth's own install (step 3 above) is safe.
 transformers==5.5.0
 trl==0.24.0
 peft==0.19.1
@@ -34,3 +35,16 @@ nbconvert==7.17.1
 
 # Tests
 pytest==9.1.1
+
+# --- Why unsloth is installed separately with --no-deps ---
+# unsloth==2026.7.2's own declared metadata pins torch<2.11.0, and
+# unsloth_zoo (its own dependency) pins torch<2.13.0 -- both stale relative
+# to what they actually run on. This project's own environment has run
+# extensively on torch==2.13.0 + unsloth==2026.7.2 together (all of Stage 1/
+# Stage 2 fine-tuning, every eval script) with no issues; `pip check` on
+# that working environment still flags the same "conflict" satisfied here,
+# confirming it's a packaging metadata lag, not a real incompatibility.
+# Installing with --no-deps skips pip re-validating that stale pin -- safe
+# here specifically because unsloth's actual runtime dependencies
+# (transformers, trl, peft, bitsandbytes, datasets, etc.) are already
+# pinned and installed above.

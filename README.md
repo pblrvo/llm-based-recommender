@@ -48,16 +48,17 @@ embeddings.
 ## Setup
 
 Requires Python 3.12 and a CUDA-capable NVIDIA GPU (12GB+ recommended) for the embedding/RQ-VAE/
-fine-tuning stages. There's no dependency manifest checked in yet; the core packages imported
-across `src/` are:
+fine-tuning stages. Dependencies are in `requirements.txt` -- install in this order (see that
+file's header comment for why unsloth is a separate final step):
 
 ```
-torch polars transformers peft trl bitsandbytes unsloth scikit-learn numpy tqdm
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements.txt
+pip install unsloth==2026.7.2 --no-deps
 ```
 
-Create a virtualenv and install these before running any pipeline stage. `unsloth` patches
-`transformers`/`trl`/`peft` at import time, so it must be imported before them wherever it's used
-(already handled in `warmup_embeddings.py`/`qlora_finetune.py`).
+`unsloth` patches `transformers`/`trl`/`peft` at import time, so it must be imported before them
+wherever it's used (already handled in `warmup_embeddings.py`/`qlora_finetune.py`).
 
 ## Running the fine-tuning stages
 
