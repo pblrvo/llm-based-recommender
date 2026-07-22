@@ -1,0 +1,36 @@
+# Core ML / tensor stack.
+# torch needs a CUDA-enabled build for the embedding/RQ-VAE/fine-tuning
+# stages (see README's Setup section) -- the default PyPI wheel is CPU-only.
+# Install it explicitly first, e.g. for CUDA 12.6:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# then install the rest of this file.
+torch==2.13.0
+
+# RQ-VAE pipeline (encoder/vector_quantizer/rqvae, train_rqvae.py)
+numpy==2.5.1
+polars==1.42.1
+scikit-learn==1.9.0
+tqdm==4.68.3
+matplotlib==3.11.0
+
+# LLM fine-tuning pipeline (warmup_embeddings.py, qlora_finetune.py):
+# Unsloth patches transformers/trl/peft at import time, so those three plus
+# bitsandbytes (4-bit quantized loading) are required alongside it, not just
+# pulled in transitively.
+unsloth==2026.7.2
+transformers==5.5.0
+trl==0.24.0
+peft==0.19.1
+bitsandbytes==0.49.2
+datasets==4.3.0
+safetensors==0.8.0
+
+# Notebooks (interactive_model_query.ipynb, evaluate_semantic_ids.ipynb) --
+# ipykernel lets a Jupyter frontend (VS Code, JupyterLab, etc.) run this
+# venv as a kernel; nbconvert additionally allows headless execution
+# (`jupyter nbconvert --to notebook --execute ...`) without one.
+ipykernel==7.3.0
+nbconvert==7.17.1
+
+# Tests
+pytest==9.1.1
