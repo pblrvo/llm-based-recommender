@@ -223,3 +223,7 @@ data/
 logs/
 runs/
 checkpoints/
+outputs/
+models/
+unsloth_compiled_cache/
+last_run_prepared/

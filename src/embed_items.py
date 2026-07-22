@@ -202,6 +202,9 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
         attention_mask = torch.from_numpy(pretokenized_data["attention_mask"])
     logger.info("Pre-tokenized data validated: %d items, padded sequence length %d", total_items, input_ids.shape[1])
 
+    # Real per-item token counts (excluding padding). Padded length is a fixed
+    # worst case (e.g. 2000), but most items are much shorter (see notebook
+    # EDA); since attention cost scales ~quadratically with sequence length,
     # batching items of similar real length together and trimming each batch
     # down to only what it needs avoids paying for padding on every batch.
     real_lengths = attention_mask.sum(dim=1)
