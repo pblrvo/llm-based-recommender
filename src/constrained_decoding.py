@@ -28,6 +28,8 @@ from typing import Dict, List, Optional
 import polars as pl
 import torch
 
+from build_finetune_dataset import AlpacaDatasetBuilder
+
 SID_START = "<|sid_start|>"
 SID_END = "<|sid_end|>"
 
@@ -72,7 +74,8 @@ def load_catalog(project_root: Path, restrict_to_interacted_items: bool = True) 
     has no chance of having learned)."""
     sid_df = pl.read_parquet(project_root / "data" / "output" / "semantic_ids.parquet")
     catalog_df = pl.read_parquet(
-        project_root / "data" / "clean_game_catalog.parquet", columns=["id", "Name", "Genres"]
+        project_root / "data" / "clean_game_catalog.parquet",
+        columns=["id", "Name", "Genres", "Categories", "About the game"],
     )
     joined = sid_df.join(catalog_df, on="id", how="inner")
 
@@ -91,9 +94,38 @@ def semantic_id_to_tokens(semantic_id: List[int]) -> str:
     return f"{SID_START}{levels}{SID_END}"
 
 
-def item_description(name: str, genres: Optional[str]) -> str:
+def item_description(name: str, genres: Optional[str], about_the_game: Optional[str] = None) -> str:
+    """"Name — Genres", optionally with a short "About the game" blurb
+    appended (". <blurb>") -- matches build_finetune_dataset.py's
+    grounding_id2name output exactly (see AlpacaDatasetBuilder._truncate_
+    blurb) so the trie built from this stays in sync with what the model
+    was actually trained to produce. about_the_game defaults to None (no
+    blurb) for callers that only need the short form (e.g. the popularity
+    baseline's SID-output tasks, unaffected by the blurb either way)."""
     genres = genres.replace(",", ", ") if genres else None
-    return f"{name} — {genres}" if genres else name
+    desc = f"{name} — {genres}" if genres else name
+    if about_the_game is not None:
+        blurb = AlpacaDatasetBuilder._truncate_blurb(about_the_game)
+        if blurb:
+            desc = f"{desc}. {blurb}"
+    return desc
+
+
+def build_sid_criteria_lookup(catalog: pl.DataFrame) -> Dict[str, dict]:
+    """semantic-ID token string -> {"genres": {...}, "categories": {...}}
+    (raw catalog values, set-valued) -- used by criteria_satisfied_at_k to
+    check whether a beam-search candidate for an nl_preference query
+    actually satisfies the genres/categories it was asked for, since that
+    task has many valid targets per query rather than one fixed correct
+    answer (see build_finetune_dataset.py's build_nl_preference_examples)."""
+    lookup = {}
+    for row in catalog.iter_rows(named=True):
+        sid = semantic_id_to_tokens(row["semantic_ids"])
+        lookup[sid] = {
+            "genres": {g.strip() for g in row["Genres"].split(",")} if row["Genres"] else set(),
+            "categories": {c.strip() for c in row["Categories"].split(",")} if row["Categories"] else set(),
+        }
+    return lookup
 
 
 def build_sid_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
@@ -108,11 +140,15 @@ def build_sid_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
 
 
 def build_name_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
-    """All valid "Name — Genres" descriptions -- used to constrain
-    grounding_id2name outputs."""
+    """All valid "Name — Genres. <blurb>" descriptions -- used to constrain
+    grounding_id2name outputs. Includes the "About the game" blurb since
+    that's what the model is actually trained to produce (see
+    item_description); a trie built from the plain "Name — Genres" form
+    would force-stop generation before the blurb, guaranteeing a mismatch
+    against every val-set target."""
     trie = Trie()
     for row in catalog.iter_rows(named=True):
-        desc = item_description(row["Name"], row["Genres"])
+        desc = item_description(row["Name"], row["Genres"], row["About the game"])
         token_ids = tokenizer(desc, add_special_tokens=False)["input_ids"]
         trie.insert(token_ids)
     return trie
@@ -271,3 +307,35 @@ def ndcg_at_k(candidates: List[str], target: str, k: int) -> float:
         return 0.0
     rank = top_k.index(target) + 1
     return 1.0 / math.log2(rank + 1)
+
+
+def _first_criteria_match_rank(candidates: List[str], criteria: dict, sid_criteria_lookup: Dict[str, dict], k: int) -> Optional[int]:
+    """1-indexed rank of the first top-k candidate whose catalog genres/
+    categories satisfy every entry in `criteria`, or None if none do."""
+    required_genres = set(criteria.get("genres", []))
+    required_categories = set(criteria.get("categories", []))
+    for rank, candidate in enumerate(candidates[:k], start=1):
+        meta = sid_criteria_lookup.get(candidate)
+        if meta is None:
+            continue  # not a real catalog item -- shouldn't happen under constrained decoding, but don't crash on it
+        if required_genres <= meta["genres"] and required_categories <= meta["categories"]:
+            return rank
+    return None
+
+
+def criteria_satisfied_at_k(candidates: List[str], criteria: dict, sid_criteria_lookup: Dict[str, dict], k: int) -> float:
+    """Recall@k analog for nl_preference: 1.0 if at least one of the top-k
+    candidates decodes to a real catalog item satisfying every genre/
+    category in `criteria`, else 0.0. Unlike recall_at_k, this doesn't check
+    for one specific stored target -- many different items can validly
+    satisfy an open-ended preference query (see build_nl_preference_examples'
+    docstring for why training doesn't hard-code a single answer either)."""
+    return 1.0 if _first_criteria_match_rank(candidates, criteria, sid_criteria_lookup, k) is not None else 0.0
+
+
+def criteria_ndcg_at_k(candidates: List[str], criteria: dict, sid_criteria_lookup: Dict[str, dict], k: int) -> float:
+    """NDCG@k analog for nl_preference, same binary-relevance formula as
+    ndcg_at_k but "relevant" means "satisfies criteria" instead of "is the
+    one stored target."""
+    rank = _first_criteria_match_rank(candidates, criteria, sid_criteria_lookup, k)
+    return 1.0 / math.log2(rank + 1) if rank is not None else 0.0

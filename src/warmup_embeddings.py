@@ -35,6 +35,33 @@ batch/more epochs) still produced 0% grounding exact-match:
    on the prompt side (history sequences, grounding_id2name's input ID),
    not only when the model is asked to generate them.
 
+Two further fixes, informed by STAR (arXiv, "Semantic-ID Token-Embedding
+Alignment for Generative Recommenders" -- an ICLR 2026 submission that
+independently formalizes almost this exact stage, published after this
+project's own codebook-grounded init was already in place):
+
+3. Gradient-masking the pretrained vocabulary (see
+   `_freeze_pretrained_vocab_gradient`). Making embed_tokens/lm_head
+   trainable, as described above, makes the WHOLE embedding matrix
+   trainable -- not just the 1026 new sid rows. Under full-sequence loss,
+   every ordinary vocabulary token appearing in a prompt gets a real
+   gradient too, so this stage's unusually high LR (1e-3) was quietly
+   perturbing the pretrained vocabulary's embeddings alongside the new
+   tokens. STAR's whole method is built on the opposite: freeze the
+   pretrained vocabulary entirely, update only the new tokens' rows. A
+   backward hook enforces the same guarantee here without giving up
+   modules_to_save/full-matrix-requires_grad (both still needed for PEFT's
+   API and tied-embedding bookkeeping) -- see also why weight_decay
+   defaults to 0.0 now, since decoupled AdamW decay isn't gated by the
+   gradient and would otherwise still shrink the "frozen" rows.
+4. Grounding-only training sample (`EmbeddingWarmupConfig.grounding_only`).
+   STAR's ablation shows their alignment gains come specifically from
+   title/description<->Semantic-ID supervision, not from broader task
+   exposure -- so this stage's sample is restricted to grounding_id2name/
+   grounding_name2id by default instead of a mix of all 7 tasks, which
+   only diluted that one signal. Stage 2's full SFT run still covers every
+   task normally.
+
 Plain transformers/TRL by default (`load_in_4bit=False`) -- this step is
 short (~750-2250 steps) and doesn't need Unsloth's speed optimizations, and
 this project hit a tied-embeddings/target_modules pitfall with Unsloth's
@@ -74,6 +101,11 @@ logger = Logger.get_logger(__name__)
 # added in build_finetune_dataset.py, not a learned RQ-VAE level -- almost
 # always 0, no codebook vector exists for it.
 CODEBOOK_LEVELS = 3
+
+# Task names the EmbeddingWarmupConfig.grounding_only sample restricts to --
+# the title/description<->Semantic-ID pairs, matching STAR's alignment-stage
+# corpus (see _freeze_pretrained_vocab_gradient's docstring for the paper).
+GROUNDING_TASKS = {"grounding_id2name", "grounding_name2id"}
 
 
 def _codebook_grounded_vectors(
@@ -158,6 +190,42 @@ def _sid_token_init_vectors(
     return vectors
 
 
+def _freeze_pretrained_vocab_gradient(model, original_vocab_size: int) -> None:
+    """Registers a backward hook on the (input and, if untied, output)
+    embedding weight so that only rows >= original_vocab_size -- the newly
+    added sid tokens -- ever receive a nonzero gradient. Everything below
+    that index is the pretrained vocabulary and must stay exactly as the
+    base model shipped it; see the STAR paper (arXiv, "Semantic-ID
+    Token-Embedding Alignment for Generative Recommenders") for why this
+    matters -- their whole method is built on freezing that half of the
+    embedding table.
+
+    Zeroing the gradient (rather than pursuing a real "only these rows are
+    Parameters" split, which isn't practical here given the frozen backbone
+    already needs the full matrix wrapped via modules_to_save/PEFT for
+    other reasons) also means AdamW's decoupled weight decay would still
+    silently shrink the "frozen" rows every step, since decoupled decay is
+    applied directly to the parameter and doesn't look at the gradient at
+    all -- that's why EmbeddingWarmupConfig.weight_decay defaults to 0.0.
+    """
+    seen = set()
+    for get_embeddings in (model.get_input_embeddings, model.get_output_embeddings):
+        weight = get_embeddings().weight
+        if id(weight) in seen:
+            continue  # tied embeddings -- same tensor, one hook is enough
+        seen.add(id(weight))
+
+        def _mask_pretrained_rows(grad, original_vocab_size=original_vocab_size):
+            grad[:original_vocab_size] = 0
+            return grad
+
+        weight.register_hook(_mask_pretrained_rows)
+    logger.info(
+        "Registered gradient mask: only embedding rows >= %d (the %d new sid tokens) will update",
+        original_vocab_size, weight.shape[0] - original_vocab_size,
+    )
+
+
 ALPACA_PROMPT = (
     "Below is an instruction that describes a task, paired with an input that provides further context. "
     "Write a response that appropriately completes the request.\n\n"
@@ -204,6 +272,15 @@ class EmbeddingWarmupConfig:
     # Only a sample -- this stage is about giving the new tokens a sane
     # starting point, not full convergence (that's Stage 2's job).
     max_training_samples: int = 20000
+    # Restricts the sample to grounding_id2name/grounding_name2id (title<->
+    # sid pairs) instead of all 7 task types. Matches STAR's (arXiv,
+    # "Semantic-ID Token-Embedding Alignment for Generative Recommenders")
+    # alignment-stage design directly -- their ablation shows the gain comes
+    # specifically from item title/description<->Semantic-ID supervision,
+    # not from broader task exposure, so mixing in sequential/similar_item/
+    # nl_preference examples here dilutes the one signal this stage actually
+    # needs. Stage 2's full SFT run still covers every task normally.
+    grounding_only: bool = True
 
     # High LR relative to normal fine-tuning (Stage 2 uses 2e-4): the only
     # trainable parameters are the two embedding matrices, freshly
@@ -222,7 +299,14 @@ class EmbeddingWarmupConfig:
     gradient_accumulation_steps: int = 4
     max_steps: int = 750
     warmup_steps: int = 50
-    weight_decay: float = 0.01
+    # Was 0.01. Decoupled AdamW weight decay is applied to every parameter
+    # directly, independent of its gradient -- so even with the pretrained
+    # vocabulary's rows gradient-masked to zero (see
+    # _freeze_pretrained_vocab_gradient), nonzero weight decay would still
+    # shrink them a little every step. Nothing in this stage should touch
+    # the pretrained vocabulary at all, so decay is off entirely rather
+    # than relying on the (tiny) effect being negligible.
+    weight_decay: float = 0.0
     lr_scheduler_type: str = "cosine"
     optimizer: str = "adamw_torch"
     logging_steps: int = 10
@@ -351,6 +435,7 @@ class EmbeddingWarmupTrainer:
             # (much smaller, near-zero) norm range.
             existing_norm_mean = model.get_input_embeddings().weight.norm(dim=-1).mean().item()
 
+            original_vocab_size = len(tokenizer)
             num_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
             model.resize_token_embeddings(len(tokenizer))
             logger.info("Added %d special tokens; vocab size now %d", num_added, len(tokenizer))
@@ -408,6 +493,23 @@ class EmbeddingWarmupTrainer:
             model.get_input_embeddings().weight.requires_grad = True
             model.get_output_embeddings().weight.requires_grad = True
 
+        # Both branches above make the WHOLE embedding matrix trainable
+        # (modules_to_save clones the entire module; requires_grad=True on
+        # the whole weight does the same directly) -- not just the new sid
+        # rows. Left alone, every ordinary vocabulary token that appears in
+        # a training example's prompt (i.e. almost all of them, under
+        # full-sequence loss) gets a real gradient update too, perturbing
+        # the pretrained vocabulary's embeddings during this stage's
+        # unusually high LR. STAR (arXiv, "Semantic-ID Token-Embedding
+        # Alignment for Generative Recommenders") makes this exact point --
+        # their alignment stage explicitly freezes the pretrained vocabulary
+        # (Etext) and updates only the new Semantic-ID rows. Registering a
+        # gradient-masking hook here gets the same guarantee without giving
+        # up the modules_to_save/full-matrix-requires_grad mechanics both
+        # branches need for other reasons (PEFT's API, tied-embedding
+        # bookkeeping).
+        _freeze_pretrained_vocab_gradient(model, original_vocab_size)
+
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         logger.info("Trainable parameters: %d / %d (%.4f%%)", trainable, total, 100 * trainable / total)
@@ -426,10 +528,25 @@ class EmbeddingWarmupTrainer:
         if not cfg.train_path.exists():
             raise FileNotFoundError(f"Train dataset not found at {cfg.train_path}. Run build_finetune_dataset.py first.")
 
-        dataset = load_dataset("json", data_files={"train": cfg.train_path.as_posix()})["train"]
+        full_dataset = load_dataset("json", data_files={"train": cfg.train_path.as_posix()})["train"]
+
+        # Captured from the FULL (unfiltered) dataset, even when
+        # grounding_only restricts the actual training sample below --
+        # sequential/asy examples won't exist in a grounding-only sample,
+        # but the generation-check probe still wants one real example of
+        # that shape to show whether the (untrained, in this stage) task
+        # looks sane or not.
+        self._sample_history = next(ex["input"] for ex in full_dataset if ex["task"] in ("sequential", "asy"))
+
+        dataset = full_dataset
+        if cfg.grounding_only:
+            before = len(dataset)
+            dataset = dataset.filter(lambda ex: ex["task"] in GROUNDING_TASKS)
+            logger.info("grounding_only: restricted sample pool %d -> %d examples", before, len(dataset))
+
         dataset = dataset.shuffle(seed=cfg.seed).select(range(min(len(dataset), cfg.max_training_samples)))
         dataset = dataset.map(self._format_example)
-        logger.info("Loaded %d sampled training examples", len(dataset))
+        logger.info("Loaded %d sampled training examples (grounding_only=%s)", len(dataset), cfg.grounding_only)
         return dataset
 
     def build_trainer(self, dataset):
@@ -462,10 +579,12 @@ class EmbeddingWarmupTrainer:
 
         # Fill in a real semantic ID for the second probe (similar_item-
         # shaped) and a real multi-item history for the third (asy-shaped)
-        # now that the dataset is loaded.
+        # now that the dataset is loaded. sample_history comes from
+        # load_dataset's unfiltered pass (see its docstring note) since
+        # grounding_only means no sequential/asy examples survive in
+        # `dataset` itself.
         sample_id = next(ex["output"] for ex in dataset if "<|sid_start|>" in ex["output"])
-        sample_history = next(ex["input"] for ex in dataset if ex["task"] in ("sequential", "asy"))
-        probe_fallbacks = [sample_id, sample_history]
+        probe_fallbacks = [sample_id, self._sample_history]
         probes = []
         fallback_idx = 0
         for instr, inp in GENERATION_PROBES:

@@ -17,7 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from constrained_decoding import (
     Trie,
     build_name_trie,
+    build_sid_criteria_lookup,
     build_sid_trie,
+    criteria_ndcg_at_k,
+    criteria_satisfied_at_k,
     hierarchical_match,
     item_description,
     make_prefix_allowed_tokens_fn,
@@ -224,6 +227,8 @@ def tiny_catalog():
         "semantic_ids": [[1, 2, 3, 0], [4, 5, 6, 0]],
         "Name": ["Half-Life 2", "Portal 2"],
         "Genres": ["Action", "Puzzle,Comedy"],
+        "Categories": [None, "Single-player,Multi-player"],
+        "About the game": ["A first-person shooter set in City 17. More detail follows here.", None],
     })
 
 
@@ -242,10 +247,46 @@ def test_build_name_trie_accepts_every_catalog_description(tiny_catalog):
     trie = build_name_trie(tokenizer, tiny_catalog)
 
     for row in tiny_catalog.iter_rows(named=True):
-        desc = item_description(row["Name"], row["Genres"])
+        desc = item_description(row["Name"], row["Genres"], row["About the game"])
         token_ids = tokenizer(desc)["input_ids"]
         node = trie.children_of(token_ids)
         assert node is not None and Trie.END in node
+
+
+def test_build_name_trie_includes_the_blurb_not_just_name_and_genres(tiny_catalog):
+    # Half-Life 2 has a real "About the game" blurb -- build_name_trie's
+    # entry for it must be the full blurb-included description, not the
+    # plain "Name — Genres" short form, since that's what
+    # grounding_id2name's real training target looks like (see
+    # build_finetune_dataset.py's build_grounding_examples). A trie built
+    # from the short form alone (the pre-fix behavior) would only ever
+    # recognize "Half-Life 2 — Action" as complete, never the real target.
+    short_form = item_description("Half-Life 2", "Action")
+    full_desc = item_description("Half-Life 2", "Action", tiny_catalog.row(0, named=True)["About the game"])
+    assert full_desc != short_form
+    assert full_desc.startswith(short_form + ".")
+
+    tokenizer = WordTokenizer()
+    trie = build_name_trie(tokenizer, tiny_catalog)
+    node = trie.children_of(tokenizer(full_desc)["input_ids"])
+    assert node is not None and Trie.END in node
+
+
+def test_item_description_without_blurb_matches_old_short_form():
+    # about_the_game=None (the default) preserves the plain "Name — Genres"
+    # form for callers that don't need the blurb (e.g. the popularity
+    # baseline's SID-output tasks).
+    assert item_description("Portal 2", "Puzzle,Comedy") == "Portal 2 — Puzzle, Comedy"
+
+
+def test_item_description_appends_truncated_blurb_when_given():
+    desc = item_description("Half-Life 2", "Action", "A first-person shooter set in City 17. More detail follows here.")
+    assert desc == "Half-Life 2 — Action. A first-person shooter set in City 17."
+
+
+def test_item_description_omits_separator_when_blurb_is_missing():
+    assert item_description("Portal 2", "Puzzle,Comedy", None) == "Portal 2 — Puzzle, Comedy"
+    assert item_description("Portal 2", "Puzzle,Comedy", "") == "Portal 2 — Puzzle, Comedy"
 
 
 # ---------------------------------------------------------------------
@@ -298,3 +339,62 @@ def test_ndcg_at_k_zero_when_outside_k():
 
 def test_ndcg_at_k_zero_when_absent():
     assert ndcg_at_k(["a", "b", "c"], "target", k=3) == 0.0
+
+
+# ---------------------------------------------------------------------
+# build_sid_criteria_lookup / criteria_satisfied_at_k / criteria_ndcg_at_k
+# ---------------------------------------------------------------------
+
+
+def test_build_sid_criteria_lookup_splits_genres_and_categories(tiny_catalog):
+    lookup = build_sid_criteria_lookup(tiny_catalog)
+    sid = semantic_id_to_tokens([1, 2, 3, 0])  # Half-Life 2, Genres="Action"
+    assert lookup[sid]["genres"] == {"Action"}
+    assert lookup[sid]["categories"] == set()  # tiny_catalog fixture has no Categories column data
+
+
+LOOKUP = {
+    "sid_action_mp": {"genres": {"Action"}, "categories": {"Multi-player"}},
+    "sid_action_only": {"genres": {"Action"}, "categories": set()},
+    "sid_rpg": {"genres": {"RPG"}, "categories": {"Single-player"}},
+}
+
+
+def test_criteria_satisfied_at_k_hit_when_genre_matches():
+    assert criteria_satisfied_at_k(["sid_action_only"], {"genres": ["Action"]}, LOOKUP, k=5) == 1.0
+
+
+def test_criteria_satisfied_at_k_miss_when_genre_absent():
+    assert criteria_satisfied_at_k(["sid_rpg"], {"genres": ["Action"]}, LOOKUP, k=5) == 0.0
+
+
+def test_criteria_satisfied_at_k_requires_all_criteria():
+    # sid_action_only has the genre but not the category -- must not count.
+    assert criteria_satisfied_at_k(["sid_action_only"], {"genres": ["Action"], "categories": ["Multi-player"]}, LOOKUP, k=5) == 0.0
+    assert criteria_satisfied_at_k(["sid_action_mp"], {"genres": ["Action"], "categories": ["Multi-player"]}, LOOKUP, k=5) == 1.0
+
+
+def test_criteria_satisfied_at_k_ignores_unknown_candidate():
+    """A candidate missing from the lookup (shouldn't happen under
+    constrained decoding, but shouldn't crash the metric either)."""
+    assert criteria_satisfied_at_k(["not_a_real_sid"], {"genres": ["Action"]}, LOOKUP, k=5) == 0.0
+
+
+def test_criteria_satisfied_at_k_respects_k_boundary():
+    candidates = ["sid_rpg", "sid_action_only"]  # match is at rank 2
+    assert criteria_satisfied_at_k(candidates, {"genres": ["Action"]}, LOOKUP, k=1) == 0.0
+    assert criteria_satisfied_at_k(candidates, {"genres": ["Action"]}, LOOKUP, k=2) == 1.0
+
+
+def test_criteria_ndcg_at_k_rank_1_is_perfect_score():
+    assert criteria_ndcg_at_k(["sid_action_only"], {"genres": ["Action"]}, LOOKUP, k=5) == pytest.approx(1.0)
+
+
+def test_criteria_ndcg_at_k_decreases_with_rank():
+    ndcg_rank_1 = criteria_ndcg_at_k(["sid_action_only", "sid_rpg"], {"genres": ["Action"]}, LOOKUP, k=5)
+    ndcg_rank_2 = criteria_ndcg_at_k(["sid_rpg", "sid_action_only"], {"genres": ["Action"]}, LOOKUP, k=5)
+    assert ndcg_rank_1 > ndcg_rank_2 > 0
+
+
+def test_criteria_ndcg_at_k_zero_when_no_match():
+    assert criteria_ndcg_at_k(["sid_rpg"], {"genres": ["Action"]}, LOOKUP, k=5) == 0.0

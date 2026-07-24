@@ -40,20 +40,76 @@ handful of fixed default answers instead of learning per-item associations:
    shortcut; flooring under-represented targets (grounding's core problem)
    gives rare items enough repetition to actually be learnable.
 
+3. Cross-task exposure cap (see `_cap_total_exposure_across_tasks`). Each
+   recommendation-shaped task's floor/ceiling bounds that task alone, but an
+   item can independently sit at the ceiling in several of them at once --
+   sequential's 50 + asy's 50 + similar_item's 20 + nl_similar_item's 20 +
+   a handful from nl_preference -- so a popular item's TOTAL exposure as a
+   target, summed across tasks, can still reach ~140 while a typical item
+   sits at a dozen. Measured pre-cap, by item_id (asy's rendered name text
+   isn't a safe grouping key -- a handful of catalog names like "F.E.A.R."
+   appear on multiple distinct rows, which would silently merge separate
+   items' counts): median total exposure 12, p90 106, p99 140, max 144
+   (Left 4 Dead 2 at 140) -- close to the ~150 that stacking every
+   individual ceiling would predict, confirming compounding is real.
+   Capped at 40: post-cap max is 40 by construction, median stays at 12
+   (untouched, already well under the cap). This is scoped to the recommendation tasks only
+   (sequential/asy/similar_item/nl_similar_item/nl_preference) -- grounding
+   is deliberately excluded, since it's not relational (see the train/val
+   split note below) and should stay exactly uniform per item.
+
+4. Description-enriched grounding_id2name (see `_truncate_blurb`). Per STAR
+   (arXiv, "Semantic-ID Token-Embedding Alignment for Generative
+   Recommenders"), grounding an item's semantic ID against real content --
+   not just its name and genre list -- is part of what drives their
+   alignment-stage gains. grounding_id2name's output is now name+genres
+   plus a short "About the game" snippet (first sentence, hard-capped at
+   MAX_BLURB_WORDS words -- catalog descriptions run to hundreds of words,
+   far past this project's 192-token sequence budget). Scoped to
+   grounding_id2name only, not asy, which reuses the same item_desc for a
+   recommendation-shaped task and should stay a plain short name.
+
+Also, three tasks reusing/extending the above:
+  - nl_preference: open-ended natural-language preference queries ("I want
+    to play racing games", "action game with multiplayer") -> a real
+    matching item's semantic ID, built from the catalog's Genres/Categories
+    fields. Unlike every other task, there's no single correct target --
+    many items validly satisfy "an action game" -- so generation shows
+    several different real targets per query instead of hard-coding one
+    (see build_nl_preference_examples), and each example carries an extra
+    "criteria" field for evaluation (see evaluate_ranking_metrics.py):
+    genre/category *consistency* is checked instead of exact-match recall.
+  - nl_similar_item: the same co-occurrence ground truth as similar_item,
+    with the input rendered as a natural-language reference to the seed
+    item's name ("recommend something like <name>") instead of its
+    semantic ID.
+
 Train/val splitting happens by GROUP (the same target_key_fn used for
-rebalancing), not by individual example. Oversampled examples are near-
-duplicates of each other (same input/output, varied instruction phrasing)
--- splitting at the example level could put 9 of an item's 10 repeats in
-train and 1 in val, making val trivially easy rather than genuinely held
-out. Splitting whole groups keeps val honest.
+rebalancing), not by individual example, for sequential/asy/similar_item/
+nl_similar_item/nl_preference -- oversampled examples are near-duplicates of
+each other (same input/output, varied instruction phrasing), so splitting at
+the example level could put 9 of an item's 10 repeats in train and 1 in val,
+making val trivially easy rather than genuinely held out. Splitting whole
+groups keeps val honest, and these tasks *should* generalize to items never
+seen as a target -- that's what makes val meaningful for them.
+
+grounding_name2id/grounding_id2name split WITHIN each item's group instead
+(train_val_split_within_group) -- grounding isn't relational, it's closer to
+an exhaustive lookup table, and testing it on items whose mapping was never
+shown in training doesn't measure a real capability gap (confirmed
+empirically: Recall@10 went from 1.8% on such items to 62.5% on items that
+were trained on -- see evaluate_ranking_metrics.py's --source flag).
 
 Each example is {"instruction", "input", "output", "task"} — "task" is metadata
 beyond the strict 3-key Alpaca schema, kept for traceability; drop it if your
-fine-tuning framework requires the exact format.
+fine-tuning framework requires the exact format. nl_preference examples carry
+one further field, "criteria" (the genres/categories the query asked for),
+also droppable for training -- both are eval-time-only metadata.
 """
 
 import json
 import random
+import re
 from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -99,6 +155,86 @@ SIMILAR_INSTRUCTIONS = [
     "Players who played this game also played the following game. Name it by semantic ID.",
 ]
 
+# nl_preference: open-ended natural-language preference queries ("I want to
+# play racing games", "action game with multiplayer") -> a real matching
+# item's semantic ID. Unlike the other tasks, many items validly satisfy a
+# given query -- there's no single correct answer, so training deliberately
+# shows several different acceptable targets per query type (see
+# build_nl_preference_examples) rather than one fixed target, and this task
+# is evaluated on genre/category *consistency*, not exact-match recall (see
+# evaluate_ranking_metrics.py).
+NL_QUERY_INSTRUCTIONS = [
+    "A player describes what kind of game they want to play. Recommend a matching game by its semantic ID.",
+    "Based on this player's request, suggest a game that fits by giving its semantic ID.",
+    "Given the following game preference, recommend a matching game's semantic ID.",
+]
+
+# {article} is "a"/"an" computed for {genre} (or {genre1}) by
+# AlpacaDatasetBuilder._indefinite_article -- "an action game", "an RPG
+# game", "a racing game". Templates where the indefinite article precedes
+# something else ("a good {genre} game", "a game that's both...") don't need
+# it, since the next word's sound doesn't depend on the genre.
+GENRE_QUERY_TEMPLATES = [
+    "I want to play {article} {genre} game.",
+    "Recommend me {article} {genre} game.",
+    "I'm looking for something in the {genre} genre.",
+    "Suggest a good {genre} game to play.",
+    "Can you recommend {article} {genre} game?",
+]
+
+GENRE_COMBO_QUERY_TEMPLATES = [
+    "I want to play {article1} {genre1} {genre2} game.",
+    "Recommend a game that's both {genre1} and {genre2}.",
+    "Looking for {article1} {genre1}/{genre2} game recommendation.",
+]
+
+CATEGORY_QUERY_TEMPLATES = [
+    "I want to play {article} {genre} game with {category}.",
+    "Recommend {article} {genre} game that supports {category}.",
+    "Looking for a {category} {genre} game.",
+    "I want {article} {genre} game I can play {category}.",
+]
+
+# Curated: only categories a real user would actually phrase a preference
+# around (excludes Steam platform features like Trading Cards/Cloud Saves/
+# Achievements, which aren't gameplay preferences). Maps the raw catalog
+# value to how it reads naturally inside CATEGORY_QUERY_TEMPLATES.
+RELEVANT_CATEGORIES = {
+    "Multi-player": "multiplayer",
+    "Co-op": "co-op",
+    "PvP": "PvP",
+    "Single-player": "singleplayer",
+}
+
+# Below this many matching items in the catalog, a genre/combo is too
+# sparse to give the model several genuinely different valid answers.
+MIN_GENRE_ITEM_COUNT = 100
+MIN_COMBO_ITEM_COUNT = 15
+
+# grounding_id2name's output gets a short "About the game" snippet appended
+# alongside name+genres (see AlpacaDatasetBuilder._truncate_blurb), per
+# STAR (arXiv, "Semantic-ID Token-Embedding Alignment for Generative
+# Recommenders") -- their alignment corpus grounds SID tokens against real
+# item descriptions, not just titles. Catalog descriptions are long (median
+# 166 words, measured on the working catalog) -- nowhere near this
+# project's 192-token sequence budget -- so this is a hard cap, not a
+# stylistic choice: first sentence, or the first MAX_BLURB_WORDS words if
+# even that runs long.
+MAX_BLURB_WORDS = 30
+
+NL_SIMILAR_INSTRUCTIONS = [
+    "A player enjoyed a game and describes it by name. Recommend a similar game by its semantic ID.",
+    "Given the name of a game a player liked, suggest a similar game's semantic ID.",
+]
+
+SIMILAR_NL_TEMPLATES = [
+    "Recommend me a game similar to {item_name}.",
+    "I want a game like {item_name}.",
+    "What's a good game similar to {item_name}?",
+    "Suggest something similar to {item_name}.",
+    "I enjoyed {item_name}. What should I play next?",
+]
+
 
 class AlpacaDatasetBuilder:
     def __init__(
@@ -138,6 +274,24 @@ class AlpacaDatasetBuilder:
         # targets, out of 681 unique, measured pre-filter) than sequential's.
         similar_target_floor: int = 3,
         similar_target_ceiling: int = 20,
+        # nl_preference: how many different real items to show as valid
+        # answers per genre / per genre-combo-or-category-combo (see
+        # build_nl_preference_examples -- there's no single correct target
+        # for an open-ended query, so this controls answer diversity, not
+        # a floor/ceiling on one item's exposure).
+        nl_examples_per_genre: int = 20,
+        nl_examples_per_combo: int = 10,
+        # Cap on an item's TOTAL appearance as a target, summed across every
+        # recommendation-shaped task (sequential/asy/similar_item/
+        # nl_similar_item/nl_preference) -- see _cap_total_exposure_across_
+        # tasks. Deliberately not applied to grounding, which stays exactly
+        # uniform per item by design. Chosen from the measured pre-cap
+        # distribution (by item_id: median 12, p90 106, p99 140, max 144):
+        # 40 compresses the extreme top end (items independently hitting
+        # multiple tasks' ceilings at once, e.g. Left 4 Dead 2 at 140) while
+        # still leaving popular items noticeably more exposure than a
+        # typical one (median 12, untouched -- well under the cap).
+        max_total_recommendation_exposure: int = 40,
         val_split: float = None,
         seed: int = 0,
     ):
@@ -155,6 +309,9 @@ class AlpacaDatasetBuilder:
         self.exclude_long_tail_users = exclude_long_tail_users
         self.restrict_to_interacted_items = restrict_to_interacted_items
         self.grounding_repeat_floor = grounding_repeat_floor
+        self.nl_examples_per_genre = nl_examples_per_genre
+        self.nl_examples_per_combo = nl_examples_per_combo
+        self.max_total_recommendation_exposure = max_total_recommendation_exposure
         self.sequential_target_floor = sequential_target_floor
         self.sequential_target_ceiling = sequential_target_ceiling
         self.similar_target_floor = similar_target_floor
@@ -164,9 +321,12 @@ class AlpacaDatasetBuilder:
         self.rng = random.Random(seed)
 
         self.sequences_df: pl.DataFrame = None
-        self.item_tokens: dict = {}  # id -> "<|sid_start|>...<|sid_end|>"
-        self.item_name: dict = {}    # id -> Name
-        self.item_desc: dict = {}    # id -> "Name — Genre, Genre" style description
+        self.item_tokens: dict = {}     # id -> "<|sid_start|>...<|sid_end|>"
+        self.item_name: dict = {}       # id -> Name
+        self.item_desc: dict = {}       # id -> "Name — Genre, Genre" style description
+        self.item_genres: dict = {}     # id -> {genre, ...} (raw catalog Genres, set-valued)
+        self.item_categories: dict = {}  # id -> {category, ...} (raw catalog Categories, set-valued)
+        self.item_blurb: dict = {}      # id -> short (<= MAX_BLURB_WORDS-word) snippet of "About the game"
 
     # ------------------------------------------------------------------
     # Setup
@@ -193,7 +353,7 @@ class AlpacaDatasetBuilder:
         sid_df = pl.read_parquet(self.semantic_ids_path)
 
         logger.info("Loading catalog from %s", self.catalog_path)
-        catalog_df = pl.read_parquet(self.catalog_path, columns=["id", "Name", "Genres"])
+        catalog_df = pl.read_parquet(self.catalog_path, columns=["id", "Name", "Genres", "Categories", "About the game"])
 
         logger.info("Loading user sequences from %s", self.sequences_path)
         self.sequences_df = pl.read_parquet(self.sequences_path)
@@ -218,6 +378,9 @@ class AlpacaDatasetBuilder:
             self.item_name[item_id] = row["Name"]
             genres = row["Genres"].replace(",", ", ") if row["Genres"] else None
             self.item_desc[item_id] = f"{row['Name']} — {genres}" if genres else row["Name"]
+            self.item_genres[item_id] = {g.strip() for g in row["Genres"].split(",")} if row["Genres"] else set()
+            self.item_categories[item_id] = {c.strip() for c in row["Categories"].split(",")} if row["Categories"] else set()
+            self.item_blurb[item_id] = self._truncate_blurb(row["About the game"])
 
         logger.info("Indexed %d items", len(self.item_tokens))
 
@@ -258,6 +421,41 @@ class AlpacaDatasetBuilder:
 
         self.rng.shuffle(rebalanced)
         return rebalanced
+
+    def _cap_total_exposure_across_tasks(self, task_examples: dict, max_total: int) -> dict:
+        """Caps an item's TOTAL appearance as a target, pooled across every
+        task in `task_examples` combined -- not just within one task.
+
+        Each task's own floor/ceiling rebalancing bounds it independently,
+        but an item can sit at the ceiling in several tasks at once
+        (sequential's 50 + asy's 50 + similar_item's 20 + nl_similar_item's
+        20 + a handful from nl_preference), so its TOTAL exposure across
+        tasks can still reach ~90-100 while a typical item sits at a
+        handful -- exactly the compounding effect behind the model
+        defaulting to a few popular titles regardless of task or input.
+
+        Pools every (task, example) pair by `_target`, and if an item's
+        combined count across all given tasks exceeds `max_total`, randomly
+        keeps `max_total` of them (irrespective of which task they came
+        from) and drops the rest. Items already under the cap are
+        untouched. Intended for the recommendation-shaped tasks only --
+        grounding is excluded by the caller, since it must stay exactly
+        uniform per item."""
+        pooled = defaultdict(list)
+        for task_name, examples in task_examples.items():
+            for ex in examples:
+                pooled[ex["_target"]].append((task_name, ex))
+
+        capped = {task_name: [] for task_name in task_examples}
+        for _, items in pooled.items():
+            if len(items) > max_total:
+                items = self.rng.sample(items, max_total)
+            for task_name, ex in items:
+                capped[task_name].append(ex)
+
+        for task_name in capped:
+            self.rng.shuffle(capped[task_name])
+        return capped
 
     # ------------------------------------------------------------------
     # Task builders
@@ -314,10 +512,17 @@ class AlpacaDatasetBuilder:
     def build_grounding_examples(self) -> tuple:
         id2name, name2id = [], []
         for item_id, tokens in self.item_tokens.items():
+            blurb = self.item_blurb[item_id]
+            # Appends a short "About the game" snippet to name+genres --
+            # not just to asy, which reuses item_desc for a recommendation-
+            # shaped task and should stay a plain short name. See
+            # MAX_BLURB_WORDS for why this stays short rather than using
+            # the raw (hundreds-of-words) description.
+            output = f"{self.item_desc[item_id]}. {blurb}" if blurb else self.item_desc[item_id]
             id2name.append({
                 "instruction": self.rng.choice(ID_TO_NAME_INSTRUCTIONS),
                 "input": tokens,
-                "output": self.item_desc[item_id],
+                "output": output,
                 "task": "grounding_id2name",
                 "_target": item_id,
             })
@@ -331,7 +536,11 @@ class AlpacaDatasetBuilder:
         logger.info("Built %d raw grounding examples (%d items x 2 directions)", len(id2name) + len(name2id), len(self.item_tokens))
         return id2name, name2id
 
-    def build_similar_examples(self) -> List[dict]:
+    def _compute_similar_partners(self) -> dict:
+        """Top co-occurring partner(s) per item, symmetric -- shared by
+        build_similar_examples (semantic-ID input) and
+        build_nl_similar_examples (natural-language input), same underlying
+        ground truth, different input rendering."""
         logger.info(
             "Computing item co-occurrence (window=%d, min_count=%d)...",
             self.cooccurrence_window, self.min_cooccurrence,
@@ -352,14 +561,15 @@ class AlpacaDatasetBuilder:
 
         logger.info("Found %d co-occurring item pairs (skipped %d long-tail users)", len(cooccurrence), skipped_users)
 
-        # Top co-occurring partner(s) per item, symmetric.
         partners: dict = {}
         for (a, b), count in cooccurrence.items():
             if count < self.min_cooccurrence:
                 continue
             partners.setdefault(a, []).append((b, count))
             partners.setdefault(b, []).append((a, count))
+        return partners
 
+    def build_similar_examples(self, partners: dict) -> List[dict]:
         examples = []
         for item_id, candidates in partners.items():
             candidates.sort(key=lambda x: x[1], reverse=True)
@@ -376,6 +586,147 @@ class AlpacaDatasetBuilder:
             "Built %d raw similar-item examples from %d items with qualifying co-occurring partners",
             len(examples), len(partners),
         )
+        return examples
+
+    def build_nl_similar_examples(self, partners: dict) -> List[dict]:
+        """Same co-occurrence ground truth as build_similar_examples, but
+        the input is a natural-language reference to the seed game's name
+        instead of its semantic ID -- "recommend something like <name>"
+        rather than "recommend something like <SID>"."""
+        examples = []
+        for item_id, candidates in partners.items():
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            item_name = self.item_name[item_id]
+            for partner_id, _count in candidates[: self.max_similar_per_item]:
+                query = self.rng.choice(SIMILAR_NL_TEMPLATES).format(item_name=item_name)
+                examples.append({
+                    "instruction": self.rng.choice(NL_SIMILAR_INSTRUCTIONS),
+                    "input": query,
+                    "output": self.item_tokens[partner_id],
+                    "task": "nl_similar_item",
+                    "_target": partner_id,
+                })
+
+        logger.info("Built %d raw nl_similar_item examples", len(examples))
+        return examples
+
+    @staticmethod
+    def _truncate_blurb(about_the_game: Optional[str]) -> str:
+        """First sentence of `about_the_game`, hard-capped at
+        MAX_BLURB_WORDS words -- catalog descriptions run to hundreds of
+        words (median 166), far past what fits in a single training
+        example alongside its instruction/name/genres text. Returns "" for
+        missing/empty input."""
+        if not about_the_game:
+            return ""
+        first_sentence = re.split(r"(?<=[.!?])\s", about_the_game.strip(), maxsplit=1)[0]
+        words = first_sentence.split()
+        if len(words) > MAX_BLURB_WORDS:
+            return " ".join(words[:MAX_BLURB_WORDS]) + "..."
+        return first_sentence
+
+    @staticmethod
+    def _natural_genre(genre: str) -> str:
+        """Lowercases a catalog genre string for natural mid-sentence
+        phrasing ("I want a racing game"), except acronym-like all-caps
+        words (RPG stays RPG, not rpg)."""
+        return " ".join(word if word.isupper() else word.lower() for word in genre.split())
+
+    # Acronym letters whose spoken NAME starts with a vowel sound (e.g. "R"
+    # is a consonant, but its letter-name "are" starts with a vowel sound --
+    # "an RPG", not "a RPG").
+    _VOWEL_SOUND_ACRONYM_LETTERS = set("FHILMNORSX")
+
+    @staticmethod
+    def _indefinite_article(genre: str) -> str:
+        """"a" or "an" as it should precede `genre` in a sentence -- "an
+        action game", "an RPG game", "a racing game". Acronyms (all-caps,
+        e.g. "RPG") are judged by their first letter's spoken NAME, not the
+        letter itself, since that's how they're actually pronounced."""
+        first_word = genre.split()[0]
+        if first_word.isupper() and len(first_word) > 1:
+            return "an" if first_word[0] in AlpacaDatasetBuilder._VOWEL_SOUND_ACRONYM_LETTERS else "a"
+        return "an" if first_word[:1].lower() in "aeiou" else "a"
+
+    def build_nl_preference_examples(self) -> List[dict]:
+        """Open-ended genre/genre-combo/genre+category preference queries.
+        Unlike every other task, there's no single correct target -- many
+        catalog items validly satisfy "I want an action game" -- so this
+        deliberately generates several different real targets per query
+        type instead of picking one, teaching the model that multiple
+        answers are acceptable rather than hard-coding a single one (which
+        would just be a subtler version of the popularity-collapse problem
+        this project has already fought once)."""
+        items_by_genre: dict = defaultdict(list)
+        for item_id, genres in self.item_genres.items():
+            for genre in genres:
+                items_by_genre[genre].append(item_id)
+
+        qualifying_genres = [g for g, items in items_by_genre.items() if len(items) >= MIN_GENRE_ITEM_COUNT]
+        logger.info("NL preference: %d genres qualify (>= %d items): %s", len(qualifying_genres), MIN_GENRE_ITEM_COUNT, sorted(qualifying_genres))
+
+        examples = []
+
+        # Single-genre queries.
+        for genre in qualifying_genres:
+            natural = self._natural_genre(genre)
+            article = self._indefinite_article(natural)
+            candidates = self.rng.sample(items_by_genre[genre], min(self.nl_examples_per_genre, len(items_by_genre[genre])))
+            for item_id in candidates:
+                query = self.rng.choice(GENRE_QUERY_TEMPLATES).format(genre=natural, article=article)
+                examples.append({
+                    "instruction": self.rng.choice(NL_QUERY_INSTRUCTIONS),
+                    "input": query,
+                    "output": self.item_tokens[item_id],
+                    "task": "nl_preference",
+                    "_target": item_id,
+                    "criteria": {"genres": [genre], "categories": []},
+                })
+
+        # Two-genre combo queries -- only where enough real items satisfy both.
+        for genre1, genre2 in combinations(sorted(qualifying_genres), 2):
+            matching = [i for i in items_by_genre[genre1] if genre2 in self.item_genres[i]]
+            if len(matching) < MIN_COMBO_ITEM_COUNT:
+                continue
+            natural1, natural2 = self._natural_genre(genre1), self._natural_genre(genre2)
+            article1 = self._indefinite_article(natural1)
+            candidates = self.rng.sample(matching, min(self.nl_examples_per_combo, len(matching)))
+            for item_id in candidates:
+                query = self.rng.choice(GENRE_COMBO_QUERY_TEMPLATES).format(
+                    genre1=natural1, genre2=natural2, article1=article1,
+                )
+                examples.append({
+                    "instruction": self.rng.choice(NL_QUERY_INSTRUCTIONS),
+                    "input": query,
+                    "output": self.item_tokens[item_id],
+                    "task": "nl_preference",
+                    "_target": item_id,
+                    "criteria": {"genres": [genre1, genre2], "categories": []},
+                })
+
+        # Genre + category (multiplayer/co-op/etc.) queries.
+        for genre in qualifying_genres:
+            natural = self._natural_genre(genre)
+            article = self._indefinite_article(natural)
+            for raw_category, natural_category in RELEVANT_CATEGORIES.items():
+                matching = [i for i in items_by_genre[genre] if raw_category in self.item_categories[i]]
+                if len(matching) < MIN_COMBO_ITEM_COUNT:
+                    continue
+                candidates = self.rng.sample(matching, min(self.nl_examples_per_combo, len(matching)))
+                for item_id in candidates:
+                    query = self.rng.choice(CATEGORY_QUERY_TEMPLATES).format(
+                        genre=natural, category=natural_category, article=article,
+                    )
+                    examples.append({
+                        "instruction": self.rng.choice(NL_QUERY_INSTRUCTIONS),
+                        "input": query,
+                        "output": self.item_tokens[item_id],
+                        "task": "nl_preference",
+                        "_target": item_id,
+                        "criteria": {"genres": [genre], "categories": [raw_category]},
+                    })
+
+        logger.info("Built %d raw nl_preference examples", len(examples))
         return examples
 
     # ------------------------------------------------------------------
@@ -401,6 +752,41 @@ class AlpacaDatasetBuilder:
             (val if key in val_keys else train).extend(group)
         return train, val
 
+    def train_val_split_within_group(self, examples: List[dict]) -> tuple:
+        """Splits WITHIN each target's group of repeated examples, instead of
+        sending the whole group to one side like train_val_split_by_group.
+
+        Used for the grounding tasks specifically: unlike sequential/
+        similar_item/asy, grounding isn't a relational task that should
+        generalize to items never seen as a target -- it's closer to an
+        exhaustive lookup table (name <-> semantic ID), and a real system
+        needs every catalog item groundable, not just a held-out-safe subset.
+        Confirmed empirically (see evaluate_ranking_metrics.py's --source
+        train/val comparison): grounding_name2id's Recall@10 went from 1.8%
+        (val, item never seen as a training target -- true for ~100% of val
+        targets under the old by-group split) to 62.5% when evaluated on
+        items the model *did* train on. The by-group split was testing
+        zero-shot recall of an arbitrary association the model was
+        structurally never given a chance to learn, not real generalization.
+
+        Every item ends up with at least one training example (a real,
+        learnable target) and, group size permitting, at least one held-out
+        example -- val here tests recall under an unseen instruction
+        phrasing, which is a meaningful generalization axis for this task,
+        unlike holding out the item's identity entirely."""
+        groups = defaultdict(list)
+        for ex in examples:
+            groups[ex["_target"]].append(ex)
+
+        train, val = [], []
+        for group in groups.values():
+            group = list(group)
+            self.rng.shuffle(group)
+            n_val = max(1, round(len(group) * self.val_split)) if len(group) > 1 else 0
+            val.extend(group[:n_val])
+            train.extend(group[n_val:])
+        return train, val
+
     def build_all(self) -> dict:
         self.load_data()
 
@@ -416,20 +802,55 @@ class AlpacaDatasetBuilder:
             name2id, lambda ex: ex["_target"], self.grounding_repeat_floor, len(name2id), NAME_TO_ID_INSTRUCTIONS,
         )
 
-        similar = self.build_similar_examples()
+        partners = self._compute_similar_partners()
+        similar = self.build_similar_examples(partners)
         similar = self._rebalance_by_target(
             similar, lambda ex: ex["_target"], self.similar_target_floor, self.similar_target_ceiling, SIMILAR_INSTRUCTIONS,
         )
+        nl_similar = self.build_nl_similar_examples(partners)
+        nl_similar = self._rebalance_by_target(
+            nl_similar, lambda ex: ex["_target"], self.similar_target_floor, self.similar_target_ceiling, NL_SIMILAR_INSTRUCTIONS,
+        )
+
+        nl_preference = self.build_nl_preference_examples()
+
+        # Cap TOTAL exposure per item across the recommendation-shaped
+        # tasks combined (see _cap_total_exposure_across_tasks) -- each
+        # task's own ceiling bounds it alone, but an item can independently
+        # hit several tasks' ceilings at once. Deliberately excludes
+        # grounding, which stays exactly uniform per item by design.
+        recommendation_tasks = self._cap_total_exposure_across_tasks(
+            {
+                "sequential": sequential, "asy": asy,
+                "similar_item": similar, "nl_similar_item": nl_similar,
+                "nl_preference": nl_preference,
+            },
+            self.max_total_recommendation_exposure,
+        )
 
         tasks = {
-            "sequential": sequential, "asy": asy,
+            "sequential": recommendation_tasks["sequential"],
+            "asy": recommendation_tasks["asy"],
             "grounding_id2name": id2name, "grounding_name2id": name2id,
-            "similar_item": similar,
+            "similar_item": recommendation_tasks["similar_item"],
+            "nl_similar_item": recommendation_tasks["nl_similar_item"],
+            "nl_preference": recommendation_tasks["nl_preference"],
+        }
+
+        # grounding tasks: split WITHIN each item's group so every item is
+        # trained on at least once (see train_val_split_within_group's
+        # docstring). Relational tasks keep the by-group split -- they
+        # should be tested on items never seen as a target, that's real
+        # generalization, not the same problem grounding had.
+        split_fn_by_task = {
+            "grounding_id2name": self.train_val_split_within_group,
+            "grounding_name2id": self.train_val_split_within_group,
         }
 
         train_all, val_all = [], []
         for name, examples in tasks.items():
-            train, val = self.train_val_split_by_group(examples)
+            split_fn = split_fn_by_task.get(name, self.train_val_split_by_group)
+            train, val = split_fn(examples)
             train_all.extend(train)
             val_all.extend(val)
             logger.info("%s: %d train, %d val", name, len(train), len(val))

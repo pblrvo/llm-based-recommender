@@ -4,6 +4,7 @@ generation. None of these call load_data(), so no parquet files are needed
 -- they operate on hand-built example lists."""
 
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -164,6 +165,66 @@ def test_rebalance_is_deterministic_given_same_seed():
 
 
 # ---------------------------------------------------------------------
+# _cap_total_exposure_across_tasks
+# ---------------------------------------------------------------------
+
+
+def test_cap_total_exposure_caps_combined_count_across_tasks():
+    builder = make_builder()
+    # target "popular" hits its own ceiling in three separate tasks:
+    # 20 + 20 + 20 = 60 combined, well above a cap of 40.
+    task_examples = {
+        "sequential": make_examples({"popular": 20, "rare": 2}, task="sequential"),
+        "similar_item": make_examples({"popular": 20}, task="similar_item"),
+        "nl_similar_item": make_examples({"popular": 20}, task="nl_similar_item"),
+    }
+    result = builder._cap_total_exposure_across_tasks(task_examples, max_total=40)
+
+    total_popular = sum(
+        1 for examples in result.values() for ex in examples if ex["_target"] == "popular"
+    )
+    total_rare = sum(
+        1 for examples in result.values() for ex in examples if ex["_target"] == "rare"
+    )
+    assert total_popular == 40
+    assert total_rare == 2  # untouched, already under the cap
+
+
+def test_cap_total_exposure_leaves_items_under_cap_untouched():
+    builder = make_builder()
+    task_examples = {
+        "sequential": make_examples({"a": 5}, task="sequential"),
+        "similar_item": make_examples({"a": 3}, task="similar_item"),
+    }
+    result = builder._cap_total_exposure_across_tasks(task_examples, max_total=40)
+    assert len(result["sequential"]) == 5
+    assert len(result["similar_item"]) == 3
+
+
+def test_cap_total_exposure_preserves_task_keys_even_when_empty():
+    builder = make_builder()
+    task_examples = {
+        "sequential": make_examples({"popular": 50}, task="sequential"),
+        "nl_preference": [],
+    }
+    result = builder._cap_total_exposure_across_tasks(task_examples, max_total=10)
+    assert set(result.keys()) == {"sequential", "nl_preference"}
+    assert result["nl_preference"] == []
+    assert len(result["sequential"]) == 10
+
+
+def test_cap_total_exposure_does_not_affect_other_targets():
+    builder = make_builder()
+    task_examples = {
+        "sequential": make_examples({"popular": 60, "other": 4}, task="sequential"),
+    }
+    result = builder._cap_total_exposure_across_tasks(task_examples, max_total=40)
+    counts = Counter(ex["_target"] for ex in result["sequential"])
+    assert counts["popular"] == 40
+    assert counts["other"] == 4
+
+
+# ---------------------------------------------------------------------
 # _rebalance_pairs_by_target (history, target) tuples
 # ---------------------------------------------------------------------
 
@@ -218,3 +279,244 @@ def test_train_val_split_single_group_goes_entirely_to_val():
     train, val = builder.train_val_split_by_group(examples)
     assert len(train) == 0
     assert len(val) == 5
+
+
+# ---------------------------------------------------------------------
+# train_val_split_within_group (grounding tasks: every item must be
+# trained on at least once -- see the function's own docstring for why)
+# ---------------------------------------------------------------------
+
+
+def test_within_group_split_every_group_appears_in_both_train_and_val():
+    builder = make_builder(val_split=0.1)
+    examples = make_examples({"a": 10, "b": 10, "c": 10})
+    train, val = builder.train_val_split_within_group(examples)
+
+    train_targets = {ex["_target"] for ex in train}
+    val_targets = {ex["_target"] for ex in val}
+    assert train_targets == {"a", "b", "c"}
+    assert val_targets == {"a", "b", "c"}  # every item held out at least once too
+
+
+def test_within_group_split_covers_every_example_exactly_once():
+    builder = make_builder(val_split=0.1)
+    examples = make_examples({"a": 10, "b": 7})
+    train, val = builder.train_val_split_within_group(examples)
+    assert len(train) + len(val) == len(examples)
+    assert {ex["input"] for ex in train} | {ex["input"] for ex in val} == {ex["input"] for ex in examples}
+    assert {ex["input"] for ex in train} & {ex["input"] for ex in val} == set()  # no example in both
+
+
+def test_within_group_split_group_of_one_goes_entirely_to_train():
+    """A group that can't be split without leaving nothing to train on
+    keeps its single example in train -- an ungroundable item would be
+    worse than an untested one."""
+    builder = make_builder(val_split=0.5)
+    examples = make_examples({"only": 1})
+    train, val = builder.train_val_split_within_group(examples)
+    assert len(train) == 1
+    assert len(val) == 0
+
+
+def test_within_group_split_reserves_at_least_one_val_example_per_group():
+    builder = make_builder(val_split=0.01)  # tiny fraction, would round to 0 without the floor
+    examples = make_examples({"a": 10})
+    train, val = builder.train_val_split_within_group(examples)
+    assert len(val) >= 1
+    assert len(train) >= 1
+
+
+# ---------------------------------------------------------------------
+# NL preference / NL similar-item queries
+# ---------------------------------------------------------------------
+
+
+def test_natural_genre_lowercases_normal_words():
+    assert AlpacaDatasetBuilder._natural_genre("Action") == "action"
+    assert AlpacaDatasetBuilder._natural_genre("Free To Play") == "free to play"
+
+
+def test_natural_genre_preserves_acronyms():
+    assert AlpacaDatasetBuilder._natural_genre("RPG") == "RPG"
+
+
+def test_indefinite_article_vowel_sound_words():
+    assert AlpacaDatasetBuilder._indefinite_article("action") == "an"
+    assert AlpacaDatasetBuilder._indefinite_article("Adventure") == "an"
+    assert AlpacaDatasetBuilder._indefinite_article("Indie") == "an"
+
+
+def test_indefinite_article_consonant_sound_words():
+    assert AlpacaDatasetBuilder._indefinite_article("racing") == "a"
+    assert AlpacaDatasetBuilder._indefinite_article("Casual") == "a"
+    assert AlpacaDatasetBuilder._indefinite_article("Strategy") == "a"
+
+
+def test_indefinite_article_acronym_judged_by_spoken_letter_name():
+    # "RPG" is pronounced "are-pee-jee" -- "an RPG", not "a RPG", even
+    # though R is a consonant letter.
+    assert AlpacaDatasetBuilder._indefinite_article("RPG") == "an"
+
+
+# ---------------------------------------------------------------------
+# _truncate_blurb / grounding_id2name description enrichment
+# ---------------------------------------------------------------------
+
+
+def test_truncate_blurb_returns_empty_string_for_missing_input():
+    assert AlpacaDatasetBuilder._truncate_blurb(None) == ""
+    assert AlpacaDatasetBuilder._truncate_blurb("") == ""
+
+
+def test_truncate_blurb_keeps_short_first_sentence_whole():
+    text = "A fast-paced racing game with online multiplayer. More text here that should be dropped."
+    assert AlpacaDatasetBuilder._truncate_blurb(text) == "A fast-paced racing game with online multiplayer."
+
+
+def test_truncate_blurb_caps_long_first_sentence_at_max_words():
+    import build_finetune_dataset as bfd
+    long_sentence = " ".join(f"word{i}" for i in range(bfd.MAX_BLURB_WORDS + 10)) + "."
+    result = AlpacaDatasetBuilder._truncate_blurb(long_sentence)
+    assert result.endswith("...")
+    assert len(result[:-3].split()) == bfd.MAX_BLURB_WORDS
+
+
+def test_truncate_blurb_handles_text_with_no_sentence_break():
+    text = "just one long run-on phrase with no terminal punctuation at all here"
+    assert AlpacaDatasetBuilder._truncate_blurb(text) == text
+
+
+def test_grounding_id2name_appends_blurb_but_name2id_and_item_desc_stay_short():
+    builder = make_builder()
+    builder.item_tokens = {"a1": "<sid-a1>"}
+    builder.item_name = {"a1": "Game A"}
+    builder.item_desc = {"a1": "Game A — Action, Indie"}
+    builder.item_blurb = {"a1": "A short punchy summary."}
+
+    id2name, name2id = builder.build_grounding_examples()
+
+    assert id2name[0]["output"] == "Game A — Action, Indie. A short punchy summary."
+    assert name2id[0]["output"] == "<sid-a1>"
+    assert name2id[0]["input"] == "Game A"
+    # item_desc itself (shared with asy) is untouched by the blurb.
+    assert builder.item_desc["a1"] == "Game A — Action, Indie"
+
+
+def test_grounding_id2name_omits_blurb_separator_when_blurb_is_empty():
+    builder = make_builder()
+    builder.item_tokens = {"a1": "<sid-a1>"}
+    builder.item_name = {"a1": "Game A"}
+    builder.item_desc = {"a1": "Game A — Action, Indie"}
+    builder.item_blurb = {"a1": ""}
+
+    id2name, _ = builder.build_grounding_examples()
+    assert id2name[0]["output"] == "Game A — Action, Indie"
+
+
+def make_catalog_builder(genre_items: dict, category_items: dict = None, seed=0):
+    """A builder with hand-populated item_genres/item_categories/item_tokens/
+    item_name, bypassing load_data() entirely -- genre_items maps genre name
+    -> list of item ids that should carry that genre."""
+    builder = make_builder(seed=seed)
+    all_ids = {i for ids in genre_items.values() for i in ids}
+    for item_id in all_ids:
+        builder.item_tokens[item_id] = f"<sid-{item_id}>"
+        builder.item_name[item_id] = f"Game {item_id}"
+        builder.item_genres[item_id] = set()
+        builder.item_categories[item_id] = set()
+    for genre, ids in genre_items.items():
+        for item_id in ids:
+            builder.item_genres[item_id].add(genre)
+    for category, ids in (category_items or {}).items():
+        for item_id in ids:
+            builder.item_categories[item_id].add(category)
+    return builder
+
+
+def test_nl_preference_single_genre_query_only_targets_matching_items():
+    import build_finetune_dataset as bfd
+    original_min = bfd.MIN_GENRE_ITEM_COUNT
+    bfd.MIN_GENRE_ITEM_COUNT = 3
+    try:
+        builder = make_catalog_builder({"Action": [f"a{i}" for i in range(5)], "Racing": [f"r{i}" for i in range(1)]})
+        examples = builder.build_nl_preference_examples()
+    finally:
+        bfd.MIN_GENRE_ITEM_COUNT = original_min
+
+    assert len(examples) > 0
+    for ex in examples:
+        assert ex["task"] == "nl_preference"
+        assert ex["_target"] in {f"a{i}" for i in range(5)}  # Racing had too few items to qualify
+        assert ex["output"] == builder.item_tokens[ex["_target"]]
+
+
+def test_nl_preference_genre_combo_requires_minimum_overlap():
+    import build_finetune_dataset as bfd
+    original_genre_min, original_combo_min = bfd.MIN_GENRE_ITEM_COUNT, bfd.MIN_COMBO_ITEM_COUNT
+    bfd.MIN_GENRE_ITEM_COUNT = 3
+    bfd.MIN_COMBO_ITEM_COUNT = 2
+    try:
+        # Action={a0,a1,a2}, RPG={a1,r0,r1} -- overlap is just {a1} (1 item),
+        # below MIN_COMBO_ITEM_COUNT=2, so the combo must be skipped entirely:
+        # expect exactly 3 (Action) + 3 (RPG) = 6 single-genre examples, 0 combo.
+        builder = make_catalog_builder({"Action": ["a0", "a1", "a2"], "RPG": ["a1", "r0", "r1"]})
+        builder.nl_examples_per_genre = 100  # no cap in play, so the count below is exact
+        examples = builder.build_nl_preference_examples()
+        assert len(examples) == 6
+    finally:
+        bfd.MIN_GENRE_ITEM_COUNT, bfd.MIN_COMBO_ITEM_COUNT = original_genre_min, original_combo_min
+
+
+def test_nl_preference_genre_combo_generated_when_overlap_is_sufficient():
+    import build_finetune_dataset as bfd
+    original_genre_min, original_combo_min = bfd.MIN_GENRE_ITEM_COUNT, bfd.MIN_COMBO_ITEM_COUNT
+    bfd.MIN_GENRE_ITEM_COUNT = 3
+    bfd.MIN_COMBO_ITEM_COUNT = 2
+    try:
+        # Action={a0,a1,a2,a3}, RPG={a0,a1,r0} -- overlap {a0,a1} (2 items),
+        # meets MIN_COMBO_ITEM_COUNT=2: expect 4 (Action) + 3 (RPG) + 2 (combo) = 9.
+        builder = make_catalog_builder({"Action": ["a0", "a1", "a2", "a3"], "RPG": ["a0", "a1", "r0"]})
+        builder.nl_examples_per_genre = 100
+        builder.nl_examples_per_combo = 100
+        examples = builder.build_nl_preference_examples()
+        assert len(examples) == 9
+    finally:
+        bfd.MIN_GENRE_ITEM_COUNT, bfd.MIN_COMBO_ITEM_COUNT = original_genre_min, original_combo_min
+
+
+def test_nl_preference_respects_examples_per_genre_cap():
+    import build_finetune_dataset as bfd
+    original_min = bfd.MIN_GENRE_ITEM_COUNT
+    bfd.MIN_GENRE_ITEM_COUNT = 3
+    try:
+        builder = make_catalog_builder({"Action": [f"a{i}" for i in range(50)]})
+        builder.nl_examples_per_genre = 5
+        examples = builder.build_nl_preference_examples()
+    finally:
+        bfd.MIN_GENRE_ITEM_COUNT = original_min
+
+    single_genre_examples = [ex for ex in examples]
+    assert len(single_genre_examples) == 5  # capped, not all 50 matching items used
+
+
+def test_compute_similar_partners_and_nl_similar_examples():
+    import polars as pl
+
+    builder = make_builder(seed=0, min_cooccurrence=1, max_similar_per_item=5)
+    builder.item_tokens = {"x": "<sid-x>", "y": "<sid-y>", "z": "<sid-z>"}
+    builder.item_name = {"x": "Game X", "y": "Game Y", "z": "Game Z"}
+    builder.sequences_df = pl.DataFrame({
+        "item_sequence": [["x", "y", "z"], ["x", "y"]],
+        "is_long_tail_user": [False, False],
+    })
+
+    partners = builder._compute_similar_partners()
+    assert "x" in partners and "y" in partners
+
+    nl_examples = builder.build_nl_similar_examples(partners)
+    assert len(nl_examples) > 0
+    item_names = set(builder.item_name.values())
+    for ex in nl_examples:
+        assert ex["task"] == "nl_similar_item"
+        assert any(name in ex["input"] for name in item_names)  # input references a real item's name
+        assert ex["output"] in builder.item_tokens.values()
