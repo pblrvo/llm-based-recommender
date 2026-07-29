@@ -31,6 +31,17 @@ class WarmupCosineScheduler:
         warmup_start_lr: float = 0.0,
         scheduler_type: str = "cosine_with_warmup",
     ):
+        """Configure the schedule and set the optimizer's initial LR.
+
+        Args:
+            optimizer: torch optimizer whose param_groups' `lr` will be updated.
+            total_steps: Total number of training steps (warmup + decay).
+            max_lr: Peak learning rate.
+            min_lr: Floor learning rate at the end of decay.
+            warmup_steps: Linear-warmup length; ignored when scheduler_type != "cosine_with_warmup".
+            warmup_start_lr: LR at step 0 of the warmup.
+            scheduler_type: "cosine" or "cosine_with_warmup".
+        """
         if scheduler_type not in VALID_SCHEDULER_TYPES:
             raise ValueError(f"Unknown scheduler_type: {scheduler_type!r}, expected one of {VALID_SCHEDULER_TYPES}")
 
@@ -53,6 +64,7 @@ class WarmupCosineScheduler:
         self._set_lr(self._last_lr)
 
     def _compute_lr(self, step: int) -> float:
+        """Compute the LR for a given step index."""
         if self.warmup_steps > 0 and step < self.warmup_steps:
             # Linear warmup
             progress = step / self.warmup_steps
@@ -65,6 +77,7 @@ class WarmupCosineScheduler:
         return self.min_lr + cosine_factor * (self.max_lr - self.min_lr)
 
     def _set_lr(self, lr: float) -> None:
+        """Write `lr` into every param_group and remember it as the most recent LR."""
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
         self._last_lr = lr
@@ -79,15 +92,20 @@ class WarmupCosineScheduler:
         return lr
 
     def get_last_lr(self) -> float:
+        """Return the most recently set learning rate."""
         return self._last_lr
 
     def state_dict(self) -> dict:
+        """Return a minimal dict capturing only the internal step counter."""
         return {"step_count": self._step_count}
 
     def load_state_dict(self, state: dict) -> None:
+        """Restore the step counter and immediately re-apply the corresponding LR.
+
+        Re-applies the LR for the restored step right away; otherwise the
+        optimizer keeps whatever LR was set at construction time (e.g.
+        warmup_start_lr) until the next .step() call.
+        """
         self._step_count = state["step_count"]
-        # Re-apply the LR for the restored step immediately, otherwise the
-        # optimizer keeps whatever LR was set at construction time (e.g.
-        # warmup_start_lr) until the next .step() call.
         self._set_lr(self._compute_lr(self._step_count))
         logger.info("Resumed LR scheduler at step %d, lr=%.2e", self._step_count, self._last_lr)

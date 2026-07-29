@@ -68,6 +68,11 @@ K_VALUES = [5, 10]
 
 
 def load_model(adapter_path: Path):
+    """Load the Qwen3-4B base model in 4-bit and attach the LoRA adapter at `adapter_path`.
+
+    Returns:
+        (model, tokenizer) pair, ready for `eval()`.
+    """
     tokenizer = AutoTokenizer.from_pretrained(adapter_path)
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
@@ -84,6 +89,7 @@ def load_model(adapter_path: Path):
 
 
 def load_val_examples_by_task(val_path: Path) -> Dict[str, List[dict]]:
+    """Read a JSONL file and group examples by their 'task' field."""
     examples_by_task = {}
     with open(val_path, encoding="utf-8") as f:
         for line in f:
@@ -95,9 +101,7 @@ def load_val_examples_by_task(val_path: Path) -> Dict[str, List[dict]]:
 def evaluate_task(
     model, tokenizer, trie: Trie, examples: List[dict], num_beams: int, temperature: Optional[float] = None,
 ) -> Dict[int, Dict[str, float]]:
-    """Runs constrained beam search over every example and returns
-    {k: {"recall": mean_recall_at_k, "ndcg": mean_ndcg_at_k}} for each K in
-    K_VALUES."""
+    """Run constrained beam search over every example and return mean Recall@k/NDCG@k per K."""
     per_k_recall = {k: [] for k in K_VALUES}
     per_k_ndcg = {k: [] for k in K_VALUES}
 
@@ -128,11 +132,7 @@ def evaluate_nl_preference_task(
     model, tokenizer, trie: Trie, examples: List[dict], num_beams: int,
     sid_criteria_lookup: Dict[str, dict], temperature: Optional[float] = None,
 ) -> Dict[int, Dict[str, float]]:
-    """Like evaluate_task, but scores genre/category *consistency*
-    (criteria_satisfied_at_k/criteria_ndcg_at_k) instead of exact-match
-    recall against ex["output"] -- nl_preference examples carry a "criteria"
-    field (see build_nl_preference_examples) precisely because there's no
-    single correct target to check recall against."""
+    """Like `evaluate_task`, but score genre/category consistency instead of exact-match recall."""
     per_k_recall = {k: [] for k in K_VALUES}
     per_k_ndcg = {k: [] for k in K_VALUES}
 
@@ -163,16 +163,19 @@ def run(
     adapter_path: Path, project_root: Path, n: int = 500, seed: int = 0, temperature: Optional[float] = None,
     source: str = "val",
 ) -> Dict[str, Dict[int, Dict[str, float]]]:
-    """source='val' (default): the normal held-out evaluation -- every task's
-    val targets are, by construction, never seen as a training target for
-    that task (see build_finetune_dataset.py's train_val_split_by_group).
-    source='train': evaluates against a sample of TRAINING examples instead
-    -- items whose exact mapping the model *did* train on directly. Useful
-    only as a diagnostic to separate "not enough model capacity" from "the
-    eval protocol tests zero-shot recall of an arbitrary mapping the model
-    was never given a chance to memorize" for the grounding tasks -- not a
-    legitimate generalization metric, since these examples were seen during
-    training."""
+    """Run Recall@K/NDCG@K evaluation for every task in TASK_TRIES.
+
+    Args:
+        adapter_path: LoRA adapter directory.
+        project_root: Repository root containing `data/`.
+        n: Examples sampled per task.
+        seed: RNG seed used to sample examples.
+        temperature: Beam-search sampling temperature; None means deterministic.
+        source: 'val' (default, held-out) or 'train' (diagnostic only).
+
+    Returns:
+        Nested dict {task: {k: {recall, ndcg}}}.
+    """
     data_path = project_root / "data" / "output" / ("sft_train.jsonl" if source == "train" else "sft_val.jsonl")
     model, tokenizer = load_model(adapter_path)
 
@@ -208,6 +211,7 @@ def run(
 
 
 def format_results(results: Dict[str, Dict[int, Dict[str, float]]]) -> str:
+    """Render a results dict as a human-readable multi-line string."""
     lines = []
     for task, per_k in results.items():
         lines.append(task + ":")

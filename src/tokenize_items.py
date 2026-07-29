@@ -1,3 +1,5 @@
+"""Tokenize the game catalog for downstream embedding generation."""
+
 import os
 import time
 from pathlib import Path
@@ -21,10 +23,24 @@ logger = Logger.get_logger(__name__)
 
 
 def get_instruction(task, text):
-
+    """Format a Qwen3-style instruction-prompt wrapper for a single text."""
     return f"Instruct: {task}\nQuery: {text}"
 
+
 def tokenize_and_save_embeddings(item_texts: List[str], tokenizer, max_length: int, batch_size: int, output_path: Path, total_items: int):
+    """Tokenize `item_texts` with the Qwen3 instruction wrapper and save them as a compressed .npz.
+
+    Args:
+        item_texts: One string per item to embed.
+        tokenizer: HuggingFace tokenizer for the Qwen3 embedding model.
+        max_length: Padded/truncated token length per item.
+        batch_size: Number of items per tokenizer call.
+        output_path: Destination .npz path.
+        total_items: Total number of items (used for logging and saved metadata).
+
+    Returns:
+        Shape of the saved input_ids array.
+    """
     logger.info(
         "Tokenizing %d items (batch_size=%d, max_length=%d)", total_items, batch_size, max_length
     )
@@ -80,6 +96,17 @@ def tokenize_and_save_embeddings(item_texts: List[str], tokenizer, max_length: i
 
 
 def tokenize_items(input_path: Path = None, output_path: Path = None, limit: int = None, max_length: int = None):
+    """CLI entry point: load the catalog, tokenize it, and save tokens to disk.
+
+    Args:
+        input_path: Source catalog parquet. Defaults to DATA_DIR/clean_game_catalog.parquet.
+        output_path: Destination .npz path. Defaults to DATA_DIR/tokenized_game_catalog.npz.
+        limit: If set, only tokenize the first `limit` items.
+        max_length: Override the default per-item token length.
+
+    Returns:
+        Shape of the saved input_ids array.
+    """
     input_path = input_path or DATA_DIR / "clean_game_catalog.parquet"
     output_path = output_path or DATA_DIR / "tokenized_game_catalog.npz"
     max_length = max_length or MAX_LENGTH

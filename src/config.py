@@ -1,3 +1,5 @@
+"""Configuration dataclass for the RQ-VAE training pipeline."""
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -9,6 +11,13 @@ logger = Logger.get_logger(__name__)
 
 @dataclass
 class RQVAEConfig:
+    """Configuration for training and evaluating the RQ-VAE.
+
+    Holds file paths, model architecture hyperparameters, and training-loop
+    settings. Defaults reflect this project's standard run (Qwen3-0.6B
+    embeddings, 3 hierarchical quantization levels, codebook size 256).
+    """
+
     data_dir: Path = Path("data")
     embeddings_path: Optional[Path] = None
     checkpoint_dir: Path = Path("checkpoints")
@@ -41,7 +50,7 @@ class RQVAEConfig:
     val_split: float = 0.05  # Validation set split ratio
 
     def __post_init__(self):
-        """Validate configuration and set computed fields."""
+        """Validate configuration, fill in computed defaults, and log a summary."""
         # Auto-generate embeddings path if not provided
         if self.embeddings_path is None:
             self.embeddings_path = self.data_dir / "output" / "games_with_embeddings.parquet"

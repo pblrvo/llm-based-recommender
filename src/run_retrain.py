@@ -30,6 +30,11 @@ STAGE2_OUTPUT_DIR = Path("outputs/qwen3-4b-qlora")
 
 
 def run_stage1():
+    """Run Stage 1 (embedding warmup) with the Qwen3-4B / 4-bit configuration.
+
+    Returns:
+        Path to the final Stage 1 checkpoint (must exist after training).
+    """
     logger.info("=== Stage 1: embedding warmup (Qwen3-4B, 4-bit) ===")
     config = EmbeddingWarmupConfig(
         base_model="Qwen/Qwen3-4B",
@@ -46,6 +51,7 @@ def run_stage1():
 
 
 def run_stage2(stage1_checkpoint: Path):
+    """Run Stage 2 (QLoRA fine-tune) initialized from `stage1_checkpoint`."""
     logger.info("=== Stage 2: QLoRA fine-tune (Qwen3-4B) ===")
     config = QLoraFineTuneConfig(
         stage1_adapter_path=stage1_checkpoint,

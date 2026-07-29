@@ -1,12 +1,7 @@
-from unsloth import FastLanguageModel  # isort: skip -- must import before transformers/trl/peft, see warmup_embeddings.py
-
 """Stage 2 (QLoRA fine-tune) for the Qwen3-4B pivot -- same rebalanced-data
 recipe as full_finetune.py (Qwen3-0.6B, full-parameter), adapted for a model
 too large to fully fine-tune on this 12GB GPU (~4B raw params needs ~24GB+
 just for weights+gradients+optimizer states in the full_finetune.py recipe).
-See the "4B vs 8B" conversation this session for why 4B was chosen over 8B:
-QLoRA is required either way at this GPU's size, and 4B's tied embeddings
-(vs. 8B's untied) meaningfully lower the trainable-embedding memory cost.
 
 Loads Stage 1's adapter checkpoint (see warmup_embeddings.py,
 `load_in_4bit=True` path) by copying its trained embed_tokens/lm_head
@@ -53,6 +48,8 @@ Otherwise identical to full_finetune.py: local rebalanced dataset
 chat template.
 """
 
+from unsloth import FastLanguageModel  # isort: skip -- must import before transformers/trl/peft, see warmup_embeddings.py
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -80,6 +77,8 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_
 
 @dataclass
 class QLoraFineTuneConfig:
+    """Configuration for the Stage 2 QLoRA fine-tune on Qwen3-4B."""
+
     base_model_name: str = "Qwen/Qwen3-4B"
     # Stage 1's adapter checkpoint (see warmup_embeddings.py) -- the trainer's
     # own periodic checkpoint, not a merged standalone model (Stage 1's final
@@ -130,6 +129,7 @@ class QLoraFineTuneConfig:
     resume_from_checkpoint: Optional[str] = None
 
     def __post_init__(self):
+        """Fill in computed train/val paths and log a config summary."""
         if self.train_path is None:
             self.train_path = self.data_dir / "output" / "sft_train.jsonl"
         if self.val_path is None:
@@ -146,15 +146,16 @@ class QLoraFineTuneConfig:
 
 
 class GenerationCheckCallback(TrainerCallback):
-    """Same purpose as full_finetune.py's version: live signal every N
-    steps instead of waiting for a multi-hour run to finish."""
+    """Periodically run fixed probes through the model for live signal during long runs."""
 
     def __init__(self, tokenizer, probes, interval: int):
+        """Store the tokenizer, fixed probes, and step interval."""
         self.tokenizer = tokenizer
         self.probes = probes
         self.interval = interval
 
     def _run(self, model, step: int):
+        """Run every probe through `model` in eval mode and log the outputs."""
         was_training = model.training
         model.eval()
         logger.info("=== Generation check at step %d ===", step)
@@ -176,23 +177,29 @@ class GenerationCheckCallback(TrainerCallback):
         model.train(was_training)
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Run probes at step 0 (before training begins)."""
         self._run(model, 0)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Run probes at every Nth training step."""
         if state.global_step > 0 and state.global_step % self.interval == 0:
             self._run(model, state.global_step)
 
 
 class QLoraFineTuneTrainer:
+    """Stage 2 trainer: copy Stage 1's embeddings onto a fresh quantized base and train QLoRA on top."""
+
     def __init__(self, config: QLoraFineTuneConfig):
+        """Store the config; load model + dataset on demand."""
         self.config = config
         self.model = None
         self.tokenizer = None
 
     def _load_stage1_embedding_weights(self, adapter_path: str):
-        """Pull just the trained embed_tokens/lm_head tensors out of Stage
-        1's adapter checkpoint (peft's modules_to_save clones), without
-        going through PeftModel/merge_and_unload -- see module docstring."""
+        """Pull just the trained embed_tokens/lm_head tensors out of Stage 1's adapter checkpoint.
+
+        Avoids PeftModel/merge_and_unload -- see module docstring.
+        """
         st_path = Path(adapter_path) / "adapter_model.safetensors"
         with safe_open(st_path.as_posix(), framework="pt") as f:
             embed = f.get_tensor("base_model.model.model.embed_tokens.modules_to_save.weight")
@@ -200,6 +207,11 @@ class QLoraFineTuneTrainer:
         return embed, lm_head
 
     def load_model(self):
+        """Load fresh Qwen3-4B in 4-bit, copy Stage 1's embedding weights, and apply QLoRA.
+
+        Returns:
+            (model, tokenizer) pair ready for SFTTrainer.
+        """
         cfg = self.config
         adapter_path = cfg.stage1_adapter_path.resolve().as_posix()
 
@@ -245,6 +257,7 @@ class QLoraFineTuneTrainer:
         return model, tokenizer
 
     def _to_prompt_completion(self, example: dict) -> dict:
+        """Convert a raw example into ChatML-style prompt + completion for SFTTrainer."""
         messages = [{"role": "user", "content": f"{example['instruction']}\n{example['input']}"}]
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -253,6 +266,7 @@ class QLoraFineTuneTrainer:
         return {"prompt": prompt, "completion": completion}
 
     def load_dataset(self):
+        """Load the train+val SFT jsonl files, capture a probe-history example, and format for SFTTrainer."""
         cfg = self.config
         dataset = load_dataset("json", data_files={
             "train": cfg.train_path.as_posix(), "validation": cfg.val_path.as_posix(),
@@ -270,6 +284,7 @@ class QLoraFineTuneTrainer:
         return dataset
 
     def build_trainer(self, dataset):
+        """Configure SFTConfig + probes and return a ready-to-train SFTTrainer."""
         cfg = self.config
         args = SFTConfig(
             output_dir=cfg.output_dir.as_posix(),
@@ -319,6 +334,7 @@ class QLoraFineTuneTrainer:
         )
 
     def train(self):
+        """Load model, load dataset, build the trainer, run training, and save the adapter."""
         self.load_model()
         dataset = self.load_dataset()
         trainer = self.build_trainer(dataset)

@@ -21,6 +21,8 @@ logger = Logger.get_logger(__name__)
 
 
 class SemanticIdExporter:
+    """Loads a trained RQ-VAE, encodes every item, optionally disambiguates collisions, and writes parquet."""
+
     def __init__(
         self,
         config: RQVAEConfig,
@@ -30,6 +32,16 @@ class SemanticIdExporter:
         batch_size: int = None,
         disambiguate_collisions: bool = True,
     ):
+        """Configure the exporter.
+
+        Args:
+            config: RQVAEConfig used to instantiate the model.
+            checkpoint_path: Trained RQ-VAE checkpoint to load.
+            output_path: Destination parquet; defaults to config.data_dir/output/semantic_ids.parquet.
+            device: Force a specific device; auto-detected when None.
+            batch_size: Items per encoding batch; defaults to config.batch_size.
+            disambiguate_collisions: If True, append a per-group disambiguator digit.
+        """
         self.config = config
         self.checkpoint_path = Path(checkpoint_path)
         self.output_path = Path(output_path) if output_path else config.data_dir / "output" / "semantic_ids.parquet"
@@ -38,6 +50,7 @@ class SemanticIdExporter:
         self.disambiguate_collisions = disambiguate_collisions
 
     def load_model(self) -> RQVAE:
+        """Instantiate the RQ-VAE from `config` and load weights from `self.checkpoint_path`."""
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
                 f"Checkpoint not found at {self.checkpoint_path}. Train the model first with train_rqvae.py."
@@ -55,6 +68,7 @@ class SemanticIdExporter:
         return model
 
     def load_items(self) -> tuple:
+        """Read item IDs and embeddings from the embeddings parquet."""
         path = self.config.embeddings_path
         logger.info("Loading id + embedding columns from %s", path)
         df = pl.read_parquet(path, columns=["id", "embedding"])
@@ -72,6 +86,7 @@ class SemanticIdExporter:
 
     @torch.no_grad()
     def encode_all(self, model: RQVAE, embeddings: torch.Tensor) -> np.ndarray:
+        """Encode all embeddings in batches; return a [N, levels] numpy array of semantic IDs."""
         n = embeddings.shape[0]
         all_semantic_ids = []
         for start in tqdm(range(0, n, self.batch_size), desc="Encoding semantic IDs"):
@@ -81,9 +96,14 @@ class SemanticIdExporter:
         return torch.cat(all_semantic_ids, dim=0).numpy()
 
     def report_collisions(self, semantic_ids: np.ndarray) -> int:
-        """Log how many items share an identical semantic ID with at least one
-        other item. A collision means an LLM trained on these IDs cannot tell
-        the affected items apart without extra disambiguation."""
+        """Log how many items share an identical semantic ID with at least one other item.
+
+        A collision means an LLM trained on these IDs cannot tell the affected
+        items apart without extra disambiguation.
+
+        Returns:
+            Number of items involved in any collision.
+        """
         n_items = semantic_ids.shape[0]
         _, counts = np.unique(semantic_ids, axis=0, return_counts=True)
         n_unique_items = (counts == 1).sum()
@@ -102,7 +122,7 @@ class SemanticIdExporter:
         return n_colliding_items
 
     def add_collision_digit(self, semantic_ids: np.ndarray) -> np.ndarray:
-        """Appends a disambiguation digit for items that share a semantic ID.
+        """Append a per-group disambiguation digit to make every full ID unique.
 
         Within each colliding group (items with identical values across all
         quantization levels), items are numbered 0, 1, 2, ... in their
@@ -130,6 +150,7 @@ class SemanticIdExporter:
         return np.concatenate([semantic_ids, disambiguator[:, None]], axis=1)
 
     def export(self) -> pl.DataFrame:
+        """Run the full export pipeline; return the saved DataFrame."""
         model = self.load_model()
         ids, embeddings = self.load_items()
         semantic_ids = self.encode_all(model, embeddings)

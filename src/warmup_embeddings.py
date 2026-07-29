@@ -3,13 +3,13 @@ token embeddings before any task-specific (LoRA) training happens.
 
 Why this exists: a prior single-stage run (add tokens, then immediately do
 task-specific LoRA training at a normal learning rate) converged on loss but
-never learned the actual semantic-ID content — 0% exact-match on grounding
+never learned the actual semantic-ID content -- 0% exact-match on grounding
 tasks despite a healthy-looking eval_loss. The new tokens had to learn "what
 am I" and "how do I get used for this task" simultaneously, which is a much
 harder optimization problem than solving them separately.
 
 This stage freezes every parameter except embed_tokens/lm_head and trains
-only those, at a high learning rate, on a data sample — giving the new
+only those, at a high learning rate, on a data sample -- giving the new
 tokens a differentiated starting point before Stage 2 (this project's
 existing axolotl LoRA pipeline, see finetune_qwen.py) does the real
 task-specific training starting from this checkpoint instead of the raw
@@ -111,20 +111,20 @@ GROUNDING_TASKS = {"grounding_id2name", "grounding_name2id"}
 def _codebook_grounded_vectors(
     rqvae_checkpoint_path: Path, hidden_size: int, target_norm: float, generator: torch.Generator,
 ) -> Dict[str, torch.Tensor]:
-    """Maps '<|sid_L{level}_{code}|>' -> an init vector for the 3 real
-    RQ-VAE levels, by projecting each level's trained codebook (32-dim)
-    into the model's embedding space with a fixed isometric projection
-    (orthonormal columns from QR-decomposing a seeded random Gaussian
-    matrix), then rescaling per level so norms land where the rest of the
-    vocabulary already lives.
+    """Build init vectors for the L0-L2 sid tokens from the trained RQ-VAE codebooks.
 
-    An isometry (not just an approximately distance-preserving random
-    projection) is used deliberately: with orthonormal columns Q,
-    ||Q v1 - Q v2|| == ||v1 - v2|| *exactly* (up to float precision), so the
-    RQ-VAE codebook's relative geometry -- which codes are close/far apart,
-    and level 0's meaningfully larger norm variation vs. levels 1/2's near-
-    uniform norms -- transfers into the LLM's embedding space unchanged,
-    just uniformly rescaled per level.
+    Projects each level's 32-dim codebook into the LLM embedding space with
+    a fixed isometric projection (orthonormal columns from QR-decomposing a
+    seeded random Gaussian), then rescales per level so norms land where
+    the rest of the vocabulary already lives.
+
+    The isometry (not just an approximately distance-preserving random
+    projection) is deliberate: with orthonormal columns Q,
+    ||Q v1 - Q v2|| == ||v1 - v2|| *exactly*, so the RQ-VAE codebook's
+    relative geometry -- which codes are close/far apart, and level 0's
+    meaningfully larger norm variation vs. levels 1/2's near-uniform
+    norms -- transfers into the LLM's embedding space unchanged, just
+    uniformly rescaled per level.
     """
     state_dict = torch.load(rqvae_checkpoint_path, map_location="cpu", weights_only=False)["model_state_dict"]
 
@@ -153,20 +153,18 @@ def _codebook_grounded_vectors(
 def _distinct_random_vectors(
     tokens: List[str], hidden_size: int, target_norm: float, generator: torch.Generator,
 ) -> Dict[str, torch.Tensor]:
-    """Independent random unit vectors, scaled to target_norm, for tokens
-    with no real learned representation to ground them in (sid_start,
-    sid_end, and the L3 collision-disambiguation digit).
+    """Build init vectors for sid tokens with no real learned codebook to ground them in.
+
+    Used for sid_start, sid_end, and the L3 collision-disambiguation digit.
+    Independent random unit vectors, scaled to target_norm.
 
     Exists because HF's default `resize_token_embeddings` turned out to be
-    worse than this simple fallback, not just theoretically (per the GTI
-    paper) but empirically here: a smoke test measured sid_start and
-    sid_end -- left at the default init -- landing at cosine similarity
-    0.9999997, i.e. functionally the same vector, before this function
-    existed. Independent draws in a 1024-dim space are nearly orthogonal to
-    each other with high probability (random unit vectors' dot products
-    have std ~1/sqrt(hidden_size)), which is what actually differentiates
-    tokens -- unlike HF's mean-centered draw, which places every new token
-    within a tiny, shared-mean-dominated cluster.
+    worse than this simple fallback, both theoretically (per the GTI paper)
+    and empirically here: a smoke test measured sid_start and sid_end --
+    left at the default init -- landing at cosine similarity 0.9999997, i.e.
+    functionally the same vector, before this function existed. Independent
+    draws in a 1024-dim space are nearly orthogonal to each other with high
+    probability, which is what actually differentiates tokens.
     """
     raw = torch.randn(len(tokens), hidden_size, generator=generator)
     unit = raw / raw.norm(dim=-1, keepdim=True)
@@ -177,9 +175,7 @@ def _distinct_random_vectors(
 def _sid_token_init_vectors(
     rqvae_checkpoint_path: Path, hidden_size: int, target_norm: float, seed: int,
 ) -> Dict[str, torch.Tensor]:
-    """All 1026 new sid token init vectors: codebook-grounded for the 768
-    L0-L2 tokens, distinct random vectors for the other 258 (sid_start,
-    sid_end, and the 256 L3 tokens)."""
+    """Build init vectors for all 1026 new sid tokens: codebook-grounded for L0-L2, distinct random for the rest."""
     generator = torch.Generator().manual_seed(seed)
 
     vectors = _codebook_grounded_vectors(rqvae_checkpoint_path, hidden_size, target_norm, generator)
@@ -191,14 +187,11 @@ def _sid_token_init_vectors(
 
 
 def _freeze_pretrained_vocab_gradient(model, original_vocab_size: int) -> None:
-    """Registers a backward hook on the (input and, if untied, output)
-    embedding weight so that only rows >= original_vocab_size -- the newly
-    added sid tokens -- ever receive a nonzero gradient. Everything below
-    that index is the pretrained vocabulary and must stay exactly as the
-    base model shipped it; see the STAR paper (arXiv, "Semantic-ID
-    Token-Embedding Alignment for Generative Recommenders") for why this
-    matters -- their whole method is built on freezing that half of the
-    embedding table.
+    """Register a backward hook that zeros gradients on pretrained vocab rows.
+
+    Both the input and (if untied) output embedding weights get a hook that
+    zeroes rows < original_vocab_size. Only the newly added sid tokens
+    (rows >= original_vocab_size) ever receive a nonzero gradient.
 
     Zeroing the gradient (rather than pursuing a real "only these rows are
     Parameters" split, which isn't practical here given the frozen backbone
@@ -252,6 +245,8 @@ GENERATION_PROBES = [
 
 @dataclass
 class EmbeddingWarmupConfig:
+    """Configuration for the Stage 1 embedding-warmup run."""
+
     data_dir: Path = Path("data")
     train_path: Optional[Path] = None
     special_tokens_path: Optional[Path] = None
@@ -321,6 +316,7 @@ class EmbeddingWarmupConfig:
     save_total_limit: int = 3
 
     def __post_init__(self):
+        """Fill in computed defaults and validate the checkpoint/quantization combination."""
         if self.train_path is None:
             self.train_path = self.data_dir / "output" / "sft_train.jsonl"
         if self.special_tokens_path is None:
@@ -346,17 +342,16 @@ class EmbeddingWarmupConfig:
 
 
 class GenerationCheckCallback(TrainerCallback):
-    """Runs a couple of fixed probes through the model periodically so
-    problems (e.g. embeddings not differentiating at all) are visible within
-    minutes, not after a multi-hour run finishes and a separate eval notebook
-    reports 0% accuracy."""
+    """Run a couple of fixed probes through the model periodically so problems surface within minutes."""
 
     def __init__(self, tokenizer, probes: List[tuple], interval: int):
+        """Store the tokenizer, fixed probes, and step interval."""
         self.tokenizer = tokenizer
         self.probes = probes
         self.interval = interval
 
     def _run(self, model, step: int):
+        """Run every probe through `model` in eval mode and log the outputs."""
         was_training = model.training
         model.eval()
         logger.info("=== Generation check at step %d ===", step)
@@ -375,20 +370,26 @@ class GenerationCheckCallback(TrainerCallback):
         model.train(was_training)
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Run probes at step 0 (before training begins)."""
         self._run(model, 0)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Run probes at every Nth training step."""
         if state.global_step > 0 and state.global_step % self.interval == 0:
             self._run(model, state.global_step)
 
 
 class EmbeddingWarmupTrainer:
+    """Stage 1 trainer: load the base LM with sid tokens added, train embed_tokens/lm_head only."""
+
     def __init__(self, config: EmbeddingWarmupConfig):
+        """Store the config; load the model and dataset on demand."""
         self.config = config
         self.model = None
         self.tokenizer = None
 
     def _load_special_tokens(self) -> List[str]:
+        """Read the sid special tokens from disk."""
         path = self.config.special_tokens_path
         if not path.exists():
             raise FileNotFoundError(f"Special tokens file not found at {path}. Run build_finetune_dataset.py first.")
@@ -398,6 +399,11 @@ class EmbeddingWarmupTrainer:
         return tokens
 
     def load_model(self):
+        """Load base model + tokenizer, add sid tokens, init their weights, and make them trainable.
+
+        Returns:
+            (model, tokenizer) pair ready for SFTTrainer.
+        """
         cfg = self.config
         special_tokens = self._load_special_tokens()
 
@@ -503,7 +509,7 @@ class EmbeddingWarmupTrainer:
         # unusually high LR. STAR (arXiv, "Semantic-ID Token-Embedding
         # Alignment for Generative Recommenders") makes this exact point --
         # their alignment stage explicitly freezes the pretrained vocabulary
-        # (Etext) and updates only the new Semantic-ID rows. Registering a
+        # and updates only the new Semantic-ID rows. Registering a
         # gradient-masking hook here gets the same guarantee without giving
         # up the modules_to_save/full-matrix-requires_grad mechanics both
         # branches need for other reasons (PEFT's API, tied-embedding
@@ -520,10 +526,12 @@ class EmbeddingWarmupTrainer:
         return model, tokenizer
 
     def _format_example(self, example: dict) -> dict:
+        """Wrap a raw example into the Alpaca prompt/completion format used by SFTTrainer."""
         prompt = ALPACA_PROMPT.format(instruction=example["instruction"], input=example["input"])
         return {"prompt": prompt, "completion": example["output"]}
 
     def load_dataset(self):
+        """Load the SFT jsonl, optionally filter to grounding-only, sample, and format."""
         cfg = self.config
         if not cfg.train_path.exists():
             raise FileNotFoundError(f"Train dataset not found at {cfg.train_path}. Run build_finetune_dataset.py first.")
@@ -550,6 +558,7 @@ class EmbeddingWarmupTrainer:
         return dataset
 
     def build_trainer(self, dataset):
+        """Configure SFTConfig + probes and return a ready-to-train SFTTrainer."""
         cfg = self.config
         args = SFTConfig(
             output_dir=cfg.output_dir.as_posix(),
@@ -603,6 +612,7 @@ class EmbeddingWarmupTrainer:
         )
 
     def train(self):
+        """Load model, load dataset, build the trainer, and run training."""
         self.load_model()
         dataset = self.load_dataset()
         trainer = self.build_trainer(dataset)

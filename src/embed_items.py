@@ -1,3 +1,5 @@
+"""Generate dense item embeddings for the catalog with the Qwen3 embedding model."""
+
 import os
 import sys
 import time
@@ -40,6 +42,7 @@ logger = Logger.get_logger(__name__)
 
 
 def get_device() -> str:
+    """Return the best available torch device: cuda, mps, or cpu."""
     if torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
@@ -51,7 +54,7 @@ def get_device() -> str:
 
 
 def last_token_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
-    """"Extracts embeddings using last token pooling"""
+    """Last-token-pool hidden states into one vector per item (handles left/right padding)."""
     left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
     if left_padding:
         return last_hidden_states[:, -1]
@@ -59,7 +62,7 @@ def last_token_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tenso
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_size = last_hidden_states.shape[0]
         return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
-    
+
 
 def generate_embeddings(
         model: AutoModel,
@@ -67,7 +70,17 @@ def generate_embeddings(
         pretokenized_batch: dict,
         target_dim = 1024,
 ) -> np.ndarray:
+    """Run `model` over one pretokenized batch and return L2-normalized embeddings.
 
+    Args:
+        model: HuggingFace embedding model.
+        device: Device the model lives on.
+        pretokenized_batch: Dict with 'input_ids' and 'attention_mask' tensors.
+        target_dim: Truncate each embedding to this many dimensions; ignored if None.
+
+    Returns:
+        numpy array of shape [batch, target_dim] (float32, CPU).
+    """
     # Move to device
     encoded = {k: v.to(device) for k, v in pretokenized_batch.items()}
 
@@ -89,10 +102,19 @@ def generate_embeddings(
 
 
 def generate_embeddings_with_oom_retry(model, device, batch: dict, target_dim: int) -> np.ndarray:
-    """Runs generate_embeddings, halving the batch and retrying on CUDA OOM.
+    """Call `generate_embeddings`, halving the batch and retrying on CUDA OOM.
 
     Safety net for cases where the adaptive batch size (calibrated on
     REFERENCE_SEQ_LEN) still doesn't fit for a particular batch/GPU.
+
+    Args:
+        model: HuggingFace embedding model.
+        device: Device the model lives on.
+        batch: Pretokenized batch dict.
+        target_dim: Embedding truncation target dimension.
+
+    Returns:
+        numpy array of embeddings.
     """
     batch_size = batch["input_ids"].size(0)
     try:
@@ -116,7 +138,7 @@ def generate_embeddings_with_oom_retry(model, device, batch: dict, target_dim: i
 
 
 def adaptive_batch_size(seq_len: int, base_batch_size: int = BATCH_SIZE, reference_len: int = REFERENCE_SEQ_LEN) -> int:
-    """Shrinks batch size for longer sequences (attention memory grows ~seq_len^2)."""
+    """Shrink batch size for longer sequences (attention memory grows ~seq_len^2)."""
     if seq_len <= reference_len:
         return base_batch_size
     scale = (reference_len / seq_len) ** 2
@@ -124,6 +146,7 @@ def adaptive_batch_size(seq_len: int, base_batch_size: int = BATCH_SIZE, referen
 
 
 def _load_checkpoint(checkpoint_path: Path, total_items: int):
+    """Load a prior checkpoint, or return None if missing/stale."""
     if not checkpoint_path.exists():
         return None
     with np.load(checkpoint_path) as ckpt:
@@ -137,6 +160,7 @@ def _load_checkpoint(checkpoint_path: Path, total_items: int):
 
 
 def _save_checkpoint(checkpoint_path: Path, embeddings: np.ndarray, filled: np.ndarray, total_items: int):
+    """Atomically save progress to `checkpoint_path` (write-temp + rename)."""
     # Write to a temp file and rename, so a crash mid-write can't corrupt
     # the last good checkpoint.
     tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
@@ -145,7 +169,19 @@ def _save_checkpoint(checkpoint_path: Path, embeddings: np.ndarray, filled: np.n
     tmp_path.replace(checkpoint_path)
     logger.info("Checkpoint saved: %d/%d items complete", int(filled.sum()), total_items)
 
+
 def embed_items(input_path: Path = None, output_path: Path = None, tokenized_path: Path = None, limit: int = None):
+    """CLI entry point: load the catalog + tokens, embed, and write embeddings to parquet.
+
+    Args:
+        input_path: Source catalog parquet. Defaults to DATA_DIR/clean_game_catalog.parquet.
+        output_path: Destination parquet. Defaults to DATA_DIR/output/games_with_embeddings.parquet.
+        tokenized_path: Pretokenized .npz from tokenize_items.py.
+        limit: If set, only embed the first `limit` items.
+
+    Returns:
+        DataFrame with the original catalog columns plus a new `embedding` column.
+    """
     device = get_device()
     input_path = input_path or DATA_DIR / "clean_game_catalog.parquet"
     output_path = output_path or DATA_DIR / "output" / "games_with_embeddings.parquet"

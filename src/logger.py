@@ -1,4 +1,4 @@
-"""Shared logging configuration for the embedding pipeline.
+"""Project-wide logging configuration.
 
 Usage:
     from logger import Logger
@@ -17,18 +17,28 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class Logger:
-    """Configures console + file handlers on the root logger exactly once,
-    then hands out named child loggers (one per module) that share them."""
+    """Configures console + file handlers on the root logger once, then hands out named child loggers."""
 
     _configured = False
 
     @classmethod
     def get_logger(cls, name: str, level: int = logging.INFO, log_file: Path = LOG_FILE) -> logging.Logger:
+        """Return a logger named `name`, configuring the root logger on first use.
+
+        Args:
+            name: Logger name (typically __name__ of the calling module).
+            level: Root logger level. Defaults to INFO.
+            log_file: File to tee log output to. Defaults to LOG_FILE.
+
+        Returns:
+            A logging.Logger that shares the root's console + file handlers.
+        """
         cls._configure_root(level, log_file)
         return logging.getLogger(name)
 
     @classmethod
     def _configure_root(cls, level: int, log_file: Path) -> None:
+        """Attach console + file handlers to the root logger exactly once."""
         if cls._configured:
             return
 

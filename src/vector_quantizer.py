@@ -1,3 +1,9 @@
+"""Vector quantization layer with rotation-trick straight-through gradient.
+
+Used as a building block by `rqvae.py` to produce hierarchical discrete
+codes (the semantic IDs) from continuous embeddings.
+"""
+
 from normalization import l2norm
 from typing import NamedTuple, Optional, Tuple
 from torch import nn
@@ -12,6 +18,17 @@ logger = Logger.get_logger(__name__)
 
 
 class QuantizationOutput(NamedTuple):
+    """Bundle of tensors returned by `VectorQuantizer.forward`.
+
+    Attributes:
+        quantized_st: Forward-pass output with straight-through gradients.
+        quantized: The nearest codebook vectors (no gradient through codes).
+        indices: Integer code indices into the codebook, one per level position.
+        loss: Combined codebook + commitment loss.
+        codebook_loss: Distance from encoder output to chosen code (codebook update target).
+        commitment_loss: Distance from code to encoder output (encoder update target).
+    """
+
     quantized_st: Tensor
     quantized: Tensor
     indices: Tensor
@@ -21,8 +38,15 @@ class QuantizationOutput(NamedTuple):
 
 
 class VectorQuantizer(nn.Module):
+    """Single-level vector quantizer with codebook usage tracking and dead-code reset."""
 
     def __init__(self, config: RQVAEConfig):
+        """Set up the codebook and usage-tracking buffers.
+
+        Args:
+            config: RQVAEConfig supplying codebook_size, codebook_embedding_dim,
+                and commitment_weight.
+        """
         super().__init__()
         self.codebook_embedding_dim = config.codebook_embedding_dim
         self.codebook_size = config.codebook_size
@@ -43,21 +67,21 @@ class VectorQuantizer(nn.Module):
 
     @staticmethod
     def safe_div(num: Tensor, den: Tensor, eps: float = 1e-6) -> Tensor:
-        # Safe division to avoid numerical issues
+        """Divide `num` by `den`, clamping the denominator to at least `eps`."""
         return num / den.clamp(min=eps)
 
     @staticmethod
     def rotation_trick(u: Tensor, q: Tensor, e: Tensor) -> Tensor:
-        """
-        Efficient rotation trick transform from Eq 4.2 in https://arxiv.org/abs/2410.06424
+        """Apply the rotation-trick straight-through estimator from arXiv:2410.06424.
 
         Args:
-            u: Unit vector from encoder output (normalized x)
-            q: Unit vector from quantized output (normalized quantized)
-            e: Original encoder output (x)
+            u: Unit vector from encoder output (normalized x).
+            q: Unit vector from quantized output (normalized quantized).
+            e: Original encoder output (x).
 
         Returns:
-            Rotated encoder output
+            Rotated encoder output that equals `q` in the forward pass but carries
+            gradients with respect to `e`.
         """
         w = l2norm(u + q, dim=-1, eps=1e-6).detach()
 
@@ -77,16 +101,15 @@ class VectorQuantizer(nn.Module):
 
     @staticmethod
     def rotate_to(src: Tensor, tgt: Tensor) -> Tensor:
-        """
-        Apply rotation trick STE from https://arxiv.org/abs/2410.06424
-        to get gradients through VQ layer.
+        """Apply the rotation-trick STE so the model can learn through the VQ layer.
 
         Args:
-            src: Source tensor (encoder output)
-            tgt: Target tensor (quantized output)
+            src: Source tensor (encoder output).
+            tgt: Target tensor (quantized output).
 
         Returns:
-            Rotated tensor that equals tgt in forward pass but has gradients
+            Rotated tensor that equals `tgt` in the forward pass but has gradients
+            with respect to `src`.
         """
         # Flatten to 2D for processing
         orig_shape = src.shape
@@ -109,6 +132,7 @@ class VectorQuantizer(nn.Module):
         return rotated.reshape(orig_shape)
 
     def find_nearest_codes(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        """Return the indices and code vectors of the nearest codebook entries to `x`."""
         input_shape = x.shape
         flat_x = x.reshape(-1, self.codebook_embedding_dim)
 
@@ -120,26 +144,33 @@ class VectorQuantizer(nn.Module):
         return indices.view(input_shape[:-1]), quantized
 
     def quantize(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        """Look up the nearest codebook vectors without computing losses or
-        updating usage stats. Use for inference/initialization paths (see
-        forward() for the training path, which tracks usage and returns
-        gradients via the straight-through estimator)."""
+        """Look up the nearest codebook vectors without computing losses or updating usage stats.
+
+        Use for inference/initialization paths (see forward() for the training path,
+        which tracks usage and returns gradients via the straight-through estimator).
+
+        Args:
+            x: Continuous input vectors.
+
+        Returns:
+            (indices, quantized vectors) tuple.
+        """
         return self.find_nearest_codes(x)
 
     def update_usage(self, indices: Tensor):
-        """Update codebook usage statistics."""
+        """Increment per-code usage counters by the number of times each code was chosen."""
         indices_flat = indices.flatten()
         self.usage_count.scatter_add_(0, indices_flat, torch.ones_like(indices_flat, dtype=torch.float))
         self.update_count += 1
 
     def get_usage_rate(self) -> float:
-        """Get proportion of codebook vectors that have been used."""
+        """Return the fraction of codebook vectors used at least once since the last reset."""
         if self.update_count == 0:
             return 0.0
         return (self.usage_count > 0).float().mean().item()
 
     def get_max_usage_share(self) -> float:
-        """Fraction of all usage claimed by the single most-used code.
+        """Return the share of all usage claimed by the single most-used code.
 
         A healthy, well-distributed codebook keeps this close to 1/codebook_size.
         A value near 1.0 means one code is doing almost all the work (index
@@ -152,10 +183,19 @@ class VectorQuantizer(nn.Module):
         return (self.usage_count.max() / total).item()
 
     def reset_usage_count(self):
-        """Reset usage count (useful for periodic resets)."""
+        """Zero out per-code usage counters (e.g. between periodic resets)."""
         self.usage_count.zero_()
 
     def forward(self, x: Tensor) -> QuantizationOutput:
+        """Quantize `x` to the nearest codebook entries, returning losses and STE-propagated output.
+
+        Args:
+            x: Continuous input vectors.
+
+        Returns:
+            QuantizationOutput holding the STE output, the chosen codes, indices,
+            and the combined + component losses.
+        """
         # Find nearest codebook vectors
         indices, quantized = self.find_nearest_codes(x)
 
@@ -188,19 +228,18 @@ class VectorQuantizer(nn.Module):
         )
 
     def reset_unused_codebook_vectors(self, batch_data: Tensor, dominance_threshold: float = None):
-        """Reset codebook vectors that are dead (zero usage) or over-dominant
-        (claiming a disproportionate share of usage).
+        """Reinit dead or over-dominant codebook entries from current batch vectors.
 
         Index collapse can happen either way: a code nobody picks is wasted
         capacity, but so is a code that ends up serving almost every input
-        while the rest of the codebook goes idle — the latter is invisible to
+        while the rest of the codebook goes idle -- the latter is invisible to
         get_usage_rate() (that code still counts as "used"), so it needs its
         own check via dominance_threshold.
 
         Args:
-            batch_data: current batch's residual at this level, used as a
+            batch_data: Current batch's residual at this level, used as a
                 source of fresh vectors for whichever codes get reset.
-            dominance_threshold: if a code's share of usage exceeds this
+            dominance_threshold: If a code's share of usage exceeds this
                 (0-1), it is reset too. None or >=1.0 disables this check.
         """
         if self.update_count == 0:

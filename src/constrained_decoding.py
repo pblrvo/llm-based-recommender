@@ -35,22 +35,28 @@ SID_END = "<|sid_end|>"
 
 
 class Trie:
-    """Token-ID prefix tree. Node = dict[token_id -> node]; END marks a
-    valid stopping point at that node (so strings that are strict prefixes
-    of other strings in the trie still work)."""
+    """Token-ID prefix tree for HF generate's prefix_allowed_tokens_fn.
+
+    Each node is a dict[token_id -> node]; END marks a valid stopping point
+    at that node (so strings that are strict prefixes of other strings in
+    the trie still work).
+    """
 
     END = -1
 
     def __init__(self):
+        """Initialize an empty trie."""
         self.root: dict = {}
 
     def insert(self, token_ids: List[int]):
+        """Add a single token-id sequence as a valid path ending at END."""
         node = self.root
         for tok in token_ids:
             node = node.setdefault(tok, {})
         node[self.END] = {}
 
     def children_of(self, prefix: List[int]) -> Optional[dict]:
+        """Return the trie node reached by walking `prefix`, or None if no such path."""
         node = self.root
         for tok in prefix:
             node = node.get(tok)
@@ -60,18 +66,19 @@ class Trie:
 
 
 def load_catalog(project_root: Path, restrict_to_interacted_items: bool = True) -> pl.DataFrame:
-    """Item id -> semantic-ID codes, name, and genres, joined the same way
-    as build_finetune_dataset.py so the trie's targets match the strings
-    the model was actually trained on.
+    """Load joined id -> semantic-ID, name, genres, descriptions for the trie.
 
-    `restrict_to_interacted_items` defaults to True to match
-    build_finetune_dataset.py's default: training data is restricted to the
-    ~8.5k items appearing in a user sequence, not the full 93k-item catalog,
-    so eval needs the same restriction -- otherwise the trie/validity sets
-    would include ~85k items the model was never trained to recognize,
-    making "valid" and "constrained exact-match" checks misleadingly
-    stricter (or the constrained decoder would offer completions the model
-    has no chance of having learned)."""
+    Matches build_finetune_dataset.py's catalog-restriction default
+    (`restrict_to_interacted_items=True`) so the trie's targets match the
+    strings the model was actually trained on.
+
+    Args:
+        project_root: Repository root (the directory containing `data/`).
+        restrict_to_interacted_items: If True, keep only items appearing in a user sequence.
+
+    Returns:
+        Polars DataFrame with columns from semantic_ids + catalog, restricted per the flag.
+    """
     sid_df = pl.read_parquet(project_root / "data" / "output" / "semantic_ids.parquet")
     catalog_df = pl.read_parquet(
         project_root / "data" / "clean_game_catalog.parquet",
@@ -90,18 +97,28 @@ def load_catalog(project_root: Path, restrict_to_interacted_items: bool = True) 
 
 
 def semantic_id_to_tokens(semantic_id: List[int]) -> str:
+    """Render a semantic ID as its full sid_start ... sid_end token string."""
     levels = "".join(f"<|sid_L{level}_{code}|>" for level, code in enumerate(semantic_id))
     return f"{SID_START}{levels}{SID_END}"
 
 
 def item_description(name: str, genres: Optional[str], about_the_game: Optional[str] = None) -> str:
-    """"Name — Genres", optionally with a short "About the game" blurb
-    appended (". <blurb>") -- matches build_finetune_dataset.py's
-    grounding_id2name output exactly (see AlpacaDatasetBuilder._truncate_
-    blurb) so the trie built from this stays in sync with what the model
-    was actually trained to produce. about_the_game defaults to None (no
-    blurb) for callers that only need the short form (e.g. the popularity
-    baseline's SID-output tasks, unaffected by the blurb either way)."""
+    """Render an item's 'Name — Genres' description, optionally with a short blurb appended.
+
+    Matches build_finetune_dataset.py's grounding_id2name output exactly
+    (see AlpacaDatasetBuilder._truncate_blurb) so the trie built from this
+    stays in sync with what the model was actually trained to produce.
+    `about_the_game` defaults to None (no blurb) for callers that only need
+    the short form.
+
+    Args:
+        name: Item name.
+        genres: Comma-separated genre string (raw catalog format), or None.
+        about_the_game: Optional blurb text appended after a period if present.
+
+    Returns:
+        The rendered description string.
+    """
     genres = genres.replace(",", ", ") if genres else None
     desc = f"{name} — {genres}" if genres else name
     if about_the_game is not None:
@@ -112,12 +129,13 @@ def item_description(name: str, genres: Optional[str], about_the_game: Optional[
 
 
 def build_sid_criteria_lookup(catalog: pl.DataFrame) -> Dict[str, dict]:
-    """semantic-ID token string -> {"genres": {...}, "categories": {...}}
-    (raw catalog values, set-valued) -- used by criteria_satisfied_at_k to
-    check whether a beam-search candidate for an nl_preference query
-    actually satisfies the genres/categories it was asked for, since that
-    task has many valid targets per query rather than one fixed correct
-    answer (see build_finetune_dataset.py's build_nl_preference_examples)."""
+    """Build a semantic-ID-string -> genres/categories lookup.
+
+    Used by criteria_satisfied_at_k to check whether a beam-search candidate
+    for an nl_preference query actually satisfies the genres/categories it
+    was asked for, since that task has many valid targets per query rather
+    than one fixed correct answer.
+    """
     lookup = {}
     for row in catalog.iter_rows(named=True):
         sid = semantic_id_to_tokens(row["semantic_ids"])
@@ -129,8 +147,10 @@ def build_sid_criteria_lookup(catalog: pl.DataFrame) -> Dict[str, dict]:
 
 
 def build_sid_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
-    """All valid `<|sid_start|>...<|sid_end|>` sequences -- used to
-    constrain grounding_name2id, sequential, and similar_item outputs."""
+    """Build a trie over every valid '<|sid_start|>...<|sid_end|>' sequence.
+
+    Used to constrain grounding_name2id, sequential, and similar_item outputs.
+    """
     trie = Trie()
     for row in catalog.iter_rows(named=True):
         tokens_str = semantic_id_to_tokens(row["semantic_ids"])
@@ -140,12 +160,14 @@ def build_sid_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
 
 
 def build_name_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
-    """All valid "Name — Genres. <blurb>" descriptions -- used to constrain
-    grounding_id2name outputs. Includes the "About the game" blurb since
-    that's what the model is actually trained to produce (see
-    item_description); a trie built from the plain "Name — Genres" form
-    would force-stop generation before the blurb, guaranteeing a mismatch
-    against every val-set target."""
+    """Build a trie over every valid 'Name — Genres. <blurb>' description.
+
+    Used to constrain grounding_id2name outputs. Includes the "About the
+    game" blurb since that's what the model is actually trained to produce
+    (see item_description); a trie built from the plain "Name — Genres"
+    form would force-stop generation before the blurb, guaranteeing a
+    mismatch against every val-set target.
+    """
     trie = Trie()
     for row in catalog.iter_rows(named=True):
         desc = item_description(row["Name"], row["Genres"], row["About the game"])
@@ -155,12 +177,23 @@ def build_name_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
 
 
 def make_prefix_allowed_tokens_fn(trie: Trie, prompt_len: int, eos_token_id: int):
-    """Factory for HF `generate()`'s `prefix_allowed_tokens_fn`. Assumes
-    batch size 1 (matches this project's per-example eval loop) since
-    prompt_len is fixed for the whole call; batch_id is accepted but
-    unused."""
+    """Build a `prefix_allowed_tokens_fn` closure for HF generate().
+
+    Assumes batch size 1 (matches this project's per-example eval loop)
+    since `prompt_len` is fixed for the whole call; `batch_id` is accepted
+    but unused.
+
+    Args:
+        trie: Constrained-decoding trie.
+        prompt_len: Length of the prompt token sequence; only generated tokens (after this) are constrained.
+        eos_token_id: EOS token id used as the fallback when the trie is desynced.
+
+    Returns:
+        Closure suitable for HF generate's `prefix_allowed_tokens_fn` arg.
+    """
 
     def fn(batch_id, input_ids):
+        """Return token ids allowed at this generation step."""
         generated = input_ids[prompt_len:].tolist()
         node = trie.children_of(generated)
         if node is None:
@@ -180,11 +213,22 @@ def make_prefix_allowed_tokens_fn(trie: Trie, prompt_len: int, eos_token_id: int
 def constrained_generate(
     model, tokenizer, prompt: str, trie: Trie, max_new_tokens: int = 32, temperature: Optional[float] = None,
 ) -> str:
-    """Decodes `prompt`, restricted at every step to trie-valid
-    continuations. Greedy (deterministic) by default; pass `temperature` to
-    sample instead -- e.g. 0.7 for some variety, higher for more. Returns
-    the completion with special tokens kept (matching this project's
-    existing eval convention), eos_token stripped."""
+    """Decode `prompt`, restricted at every step to trie-valid continuations.
+
+    Greedy (deterministic) by default; pass `temperature` to sample instead.
+
+    Args:
+        model: HF causal LM.
+        tokenizer: Matching HF tokenizer.
+        prompt: Prompt string.
+        trie: Constrained-decoding trie.
+        max_new_tokens: Maximum number of generated tokens.
+        temperature: Sampling temperature; None means greedy decoding.
+
+    Returns:
+        The completion with special tokens kept (matching this project's
+        existing eval convention), eos_token stripped.
+    """
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     prompt_len = inputs["input_ids"].shape[1]
     allowed_fn = make_prefix_allowed_tokens_fn(trie, prompt_len, tokenizer.eos_token_id)
@@ -211,9 +255,9 @@ def constrained_beam_search(
     model, tokenizer, prompt: str, trie: Trie, num_beams: int, max_new_tokens: int = 32,
     temperature: Optional[float] = None,
 ) -> List[str]:
-    """Like `constrained_generate`, but returns `num_beams` candidate
-    completions via beam search instead of one greedy/sampled completion --
-    the ranking equivalent of a classic recommender's top-K scored items,
+    """Like `constrained_generate`, but return `num_beams` candidates via beam search.
+
+    The ranking equivalent of a classic recommender's top-K scored items,
     since a single greedy decode is a top-1 prediction, not a ranking.
     Ordered best-first (beam score). Used for Recall@K/NDCG@K, computed the
     same way as TIGER (Rajput et al. 2023) and LC-Rec evaluate semantic-ID
@@ -222,12 +266,21 @@ def constrained_beam_search(
     items.
 
     Deterministic beam search by default; pass `temperature` to switch to
-    beam-search multinomial sampling (each beam samples from the
-    temperature-scaled distribution instead of always expanding the
-    highest-probability continuations) -- trades some ranking precision for
-    beam diversity, which matters when deterministic beam search's beams
-    tend to collapse onto near-identical high-probability variants of the
-    same prefix rather than covering genuinely different candidates."""
+    beam-search multinomial sampling -- trades some ranking precision for
+    beam diversity.
+
+    Args:
+        model: HF causal LM.
+        tokenizer: Matching HF tokenizer.
+        prompt: Prompt string.
+        trie: Constrained-decoding trie.
+        num_beams: Number of beams (and candidates returned).
+        max_new_tokens: Maximum number of generated tokens per candidate.
+        temperature: Sampling temperature; None means deterministic beam search.
+
+    Returns:
+        List of `num_beams` completion strings, best-first.
+    """
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     prompt_len = inputs["input_ids"].shape[1]
     allowed_fn = make_prefix_allowed_tokens_fn(trie, prompt_len, tokenizer.eos_token_id)
@@ -258,9 +311,11 @@ _SID_LEVEL_TOKEN = re.compile(r"<\|sid_L(\d)_(\d+)\|>")
 
 
 def parse_sid_codes(text: str) -> Optional[List[int]]:
-    """Extracts the 4 level codes from a '<|sid_start|>...<|sid_end|>'
-    string, ordered [L0, L1, L2, L3]. None if `text` doesn't contain
-    exactly one code per level 0-3 (malformed/truncated output)."""
+    """Extract the 4 level codes from a '<|sid_start|>...<|sid_end|>' string.
+
+    Returns codes ordered [L0, L1, L2, L3], or None if `text` doesn't contain
+    exactly one code per level 0-3 (malformed/truncated output).
+    """
     matches = _SID_LEVEL_TOKEN.findall(text)
     if len(matches) != 4:
         return None
@@ -271,11 +326,13 @@ def parse_sid_codes(text: str) -> Optional[List[int]]:
 
 
 def hierarchical_match(predicted: str, expected: str) -> Dict[str, bool]:
-    """Prefix-accuracy at each RQ-VAE hierarchy level: how much of the code
-    sequence is correct before the first mismatch. `l0123` is equivalent to
-    plain exact-match; `l0`/`l01`/`l012` show partial credit pure exact-match
-    can't -- e.g. "right coarse cluster, wrong disambiguation digit" vs.
-    "wrong from the first code"."""
+    """Compute prefix-accuracy at each RQ-VAE hierarchy level.
+
+    Returns flags for `l0`, `l01`, `l012`, and `l0123` (full exact-match).
+    Partial-prefix flags show partial credit pure exact-match can't -- e.g.
+    "right coarse cluster, wrong disambiguation digit" vs. "wrong from the
+    first code".
+    """
     pred_codes = parse_sid_codes(predicted)
     exp_codes = parse_sid_codes(expected)
     result = {"valid_format": pred_codes is not None, "l0": False, "l01": False, "l012": False, "l0123": False}
@@ -289,19 +346,20 @@ def hierarchical_match(predicted: str, expected: str) -> Dict[str, bool]:
 
 
 def recall_at_k(candidates: List[str], target: str, k: int) -> float:
-    """1.0 if `target` appears among the top-`k` `candidates` (ordered
-    best-first, e.g. by beam score), else 0.0. `candidates` may have fewer
-    than k entries (e.g. beam search returned fewer valid completions than
-    requested) -- treated as-is, no padding needed since membership doesn't
-    depend on length."""
+    """Return 1.0 if `target` appears among the top-`k` `candidates` (best-first), else 0.0.
+
+    `candidates` may have fewer than k entries -- treated as-is, no padding
+    needed since membership doesn't depend on length.
+    """
     return 1.0 if target in candidates[:k] else 0.0
 
 
 def ndcg_at_k(candidates: List[str], target: str, k: int) -> float:
-    """Binary-relevance NDCG@k: 1/log2(rank+1) if `target` is within the
-    top-k of `candidates` (rank is 1-indexed), else 0.0. With exactly one
-    relevant item per query, the ideal DCG is always 1 (a single relevant
-    item at rank 1), so this reduces to plain DCG@k."""
+    """Binary-relevance NDCG@k: 1/log2(rank+1) if `target` is within top-k, else 0.0.
+
+    With exactly one relevant item per query, the ideal DCG is always 1
+    (a single relevant item at rank 1), so this reduces to plain DCG@k.
+    """
     top_k = candidates[:k]
     if target not in top_k:
         return 0.0
@@ -310,8 +368,10 @@ def ndcg_at_k(candidates: List[str], target: str, k: int) -> float:
 
 
 def _first_criteria_match_rank(candidates: List[str], criteria: dict, sid_criteria_lookup: Dict[str, dict], k: int) -> Optional[int]:
-    """1-indexed rank of the first top-k candidate whose catalog genres/
-    categories satisfy every entry in `criteria`, or None if none do."""
+    """Return the 1-indexed rank of the first top-k candidate satisfying every entry in `criteria`.
+
+    Returns None if no candidate in the top-k satisfies the criteria.
+    """
     required_genres = set(criteria.get("genres", []))
     required_categories = set(criteria.get("categories", []))
     for rank, candidate in enumerate(candidates[:k], start=1):
@@ -324,18 +384,16 @@ def _first_criteria_match_rank(candidates: List[str], criteria: dict, sid_criter
 
 
 def criteria_satisfied_at_k(candidates: List[str], criteria: dict, sid_criteria_lookup: Dict[str, dict], k: int) -> float:
-    """Recall@k analog for nl_preference: 1.0 if at least one of the top-k
-    candidates decodes to a real catalog item satisfying every genre/
-    category in `criteria`, else 0.0. Unlike recall_at_k, this doesn't check
-    for one specific stored target -- many different items can validly
-    satisfy an open-ended preference query (see build_nl_preference_examples'
-    docstring for why training doesn't hard-code a single answer either)."""
+    """Return 1.0 if at least one of the top-k candidates satisfies `criteria`, else 0.0.
+
+    Recall@k analog for nl_preference: doesn't check for one specific stored
+    target -- many different items can validly satisfy an open-ended
+    preference query.
+    """
     return 1.0 if _first_criteria_match_rank(candidates, criteria, sid_criteria_lookup, k) is not None else 0.0
 
 
 def criteria_ndcg_at_k(candidates: List[str], criteria: dict, sid_criteria_lookup: Dict[str, dict], k: int) -> float:
-    """NDCG@k analog for nl_preference, same binary-relevance formula as
-    ndcg_at_k but "relevant" means "satisfies criteria" instead of "is the
-    one stored target."""
+    """Return NDCG@k analog for nl_preference, using criteria-satisfaction as the relevance signal."""
     rank = _first_criteria_match_rank(candidates, criteria, sid_criteria_lookup, k)
     return 1.0 / math.log2(rank + 1) if rank is not None else 0.0

@@ -23,6 +23,7 @@ logger = Logger.get_logger(__name__)
 
 
 def get_device() -> str:
+    """Return the best available torch device: cuda, mps, or cpu."""
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
@@ -31,6 +32,8 @@ def get_device() -> str:
 
 
 class RQVAETrainer:
+    """Training loop, validation, logging, and checkpointing for the RQ-VAE."""
+
     def __init__(
         self,
         config: RQVAEConfig,
@@ -40,6 +43,16 @@ class RQVAETrainer:
         checkpoint_every: int = 500,
         histogram_every: int = 100,
     ):
+        """Configure device, logging paths, and evaluation/checkpoint intervals.
+
+        Args:
+            config: RQVAEConfig holding model + training hyperparameters.
+            device: Force a specific device; auto-detected when None.
+            tensorboard_dir: TensorBoard log root. Defaults to runs/rqvae_<timestamp>.
+            val_every: Run validation every N epochs.
+            checkpoint_every: Save a numbered checkpoint every N epochs.
+            histogram_every: Log weight histograms every N epochs.
+        """
         self.config = config
         self.device = device or get_device()
         self.tensorboard_dir = Path(tensorboard_dir) if tensorboard_dir else (
@@ -65,6 +78,7 @@ class RQVAETrainer:
     # ------------------------------------------------------------------
 
     def load_data(self):
+        """Load embeddings from disk, split train/val, and build DataLoaders."""
         path = self.config.embeddings_path
         logger.info("Loading item embeddings from %s", path)
         df = pl.read_parquet(path, columns=["embedding"])
@@ -90,6 +104,7 @@ class RQVAETrainer:
         self.val_loader = DataLoader(TensorDataset(val_tensor), batch_size=self.config.batch_size, shuffle=False)
 
     def build(self):
+        """Instantiate the model, optimizer, scheduler, and TensorBoard writer."""
         self.model = RQVAE(self.config).to(self.device)
 
         if self.config.use_kmeans_init:
@@ -118,6 +133,14 @@ class RQVAETrainer:
     # ------------------------------------------------------------------
 
     def train_step(self, batch: torch.Tensor) -> dict:
+        """Run one training step: forward, backward, clip, optimizer, scheduler, optional codebook reset.
+
+        Args:
+            batch: A single training batch of embeddings.
+
+        Returns:
+            Dict of scalar metrics for logging.
+        """
         self.model.train()
         batch = batch.to(self.device)
 
@@ -143,6 +166,7 @@ class RQVAETrainer:
         return metrics
 
     def _maybe_reset_dead_codes(self, level_residuals: list):
+        """Reset dead or over-dominant codebook entries when their thresholds are breached."""
         for level, vq_layer in enumerate(self.model.vq_layers):
             usage_rate = vq_layer.get_usage_rate()
             max_share = vq_layer.get_max_usage_share()
@@ -153,6 +177,7 @@ class RQVAETrainer:
 
     @torch.no_grad()
     def validate(self) -> dict:
+        """Run the model over the val set; return averaged loss metrics plus unique-IDs proportion."""
         self.model.eval()
         total_loss, total_recon, total_vq, n_batches = 0.0, 0.0, 0.0, 0
         all_semantic_ids = []
@@ -175,6 +200,7 @@ class RQVAETrainer:
         }
 
     def _extract_metrics(self, loss_dict: dict, all_indices: list) -> dict:
+        """Build the per-step metrics dict from a model's loss output and indices."""
         semantic_ids = torch.stack(all_indices, dim=-1)
         return {
             "loss": loss_dict["loss"].item(),
@@ -190,6 +216,7 @@ class RQVAETrainer:
 
     @staticmethod
     def _scalar(value) -> float:
+        """Coerce a torch.Tensor (or numeric) into a Python float."""
         return value.item() if isinstance(value, torch.Tensor) else float(value)
 
     # ------------------------------------------------------------------
@@ -197,6 +224,7 @@ class RQVAETrainer:
     # ------------------------------------------------------------------
 
     def log_metrics(self, metrics: dict, prefix: str):
+        """Write a metrics dict to TensorBoard under `prefix/` (e.g. 'train', 'val')."""
         w = self.writer
         w.add_scalar(f"{prefix}/loss", metrics["loss"], self.global_step)
         w.add_scalar(f"{prefix}/recon_loss", metrics["recon_loss"], self.global_step)
@@ -221,12 +249,14 @@ class RQVAETrainer:
             w.add_scalar("train/lr", metrics["lr"], self.global_step)
 
     def log_histograms(self):
+        """Log per-level codebook and encoder-weight histograms to TensorBoard."""
         for level, vq_layer in enumerate(self.model.vq_layers):
             self.writer.add_histogram(f"codebook_weights/level_{level}", vq_layer.embedding.weight, self.global_step)
         for name, param in self.model.encoder.named_parameters():
             self.writer.add_histogram(f"encoder_weights/{name}", param, self.global_step)
 
     def save_checkpoint(self, tag: str):
+        """Persist model + optimizer + scheduler state to checkpoints/rqvae_<tag>.pt."""
         self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = self.config.checkpoint_dir / f"rqvae_{tag}.pt"
         torch.save(
@@ -243,6 +273,7 @@ class RQVAETrainer:
         logger.info("Saved checkpoint: %s (step=%d)", path, self.global_step)
 
     def load_checkpoint(self, path: Path):
+        """Restore model + optimizer + scheduler state from a saved checkpoint file."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -256,6 +287,7 @@ class RQVAETrainer:
     # ------------------------------------------------------------------
 
     def train(self):
+        """Run the full training loop: data setup, build, then per-epoch train/val/log/save."""
         self.load_data()
         self.build()
 
