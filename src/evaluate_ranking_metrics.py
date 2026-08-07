@@ -17,10 +17,14 @@ ranking step a dot-product-over-all-items model gets for free.
 Covers the tasks with a well-defined "one correct target" ranking question:
   - grounding_name2id / sequential / similar_item / nl_similar_item: rank
     candidate semantic IDs via the sid_trie.
-  - grounding_id2name: rank candidate name+genres descriptions via the
-    name_trie.
-`asy` is skipped -- its target is the same (history -> name) question as
-grounding_id2name/sequential combined, not a distinct ranking question.
+  - grounding_id2name / asy: rank candidate name+genres(+blurb)
+    descriptions via the name_trie (which accepts both the short
+    "Name — Genres" form asy targets and the blurb-enriched long form
+    grounding_id2name targets -- see build_name_trie), then score via
+    `name_lookup` -- both the candidates and the target are mapped down to
+    just the item's plain Name before recall_at_k/ndcg_at_k, so the metric
+    asks "did it predict the correct game" rather than requiring an exact
+    match on genres/blurb text too.
 
 nl_preference is a different kind of question -- many items can validly
 satisfy an open-ended query like "an action game", so there's no single
@@ -41,6 +45,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from constrained_decoding import (
     Trie,
+    build_name_lookup,
     build_name_trie,
     build_sid_criteria_lookup,
     build_sid_trie,
@@ -62,9 +67,23 @@ TASK_TRIES = {
     "similar_item": "sid",
     "nl_similar_item": "sid",
     "grounding_id2name": "name",
+    "asy": "name",
     "nl_preference": "sid",
 }
+# Tasks scored via name_lookup (candidate/target collapsed to plain item
+# Name before recall_at_k/ndcg_at_k) rather than raw exact-match -- both
+# produce name+genres(+blurb) text, not a single-token-family output like
+# the sid tasks, so "predicted the correct game" is the meaningful
+# question, not exact string equality on the full description.
+NAME_ONLY_TASKS = {"grounding_id2name", "asy"}
 K_VALUES = [5, 10]
+# 32 (evaluate_task's default) is exactly right for the 6-token sid outputs
+# but far too small for name_trie targets once grounding_id2name includes
+# a blurb -- measured up to ~90+ tokens for name+genres+blurb. See
+# evaluate_task's docstring for why too-small a value here silently
+# produces unmatchable (truncated-before-any-trie-END) candidates rather
+# than just shorter ones.
+NAME_TASK_MAX_NEW_TOKENS = 96
 
 
 def load_model(adapter_path: Path):
@@ -100,8 +119,28 @@ def load_val_examples_by_task(val_path: Path) -> Dict[str, List[dict]]:
 
 def evaluate_task(
     model, tokenizer, trie: Trie, examples: List[dict], num_beams: int, temperature: Optional[float] = None,
+    result_lookup: Optional[Dict[str, str]] = None, max_new_tokens: int = 32,
 ) -> Dict[int, Dict[str, float]]:
-    """Run constrained beam search over every example and return mean Recall@k/NDCG@k per K."""
+    """Run constrained beam search over every example and return mean Recall@k/NDCG@k per K.
+
+    `result_lookup`, if given, maps each candidate and the target through it
+    before scoring -- e.g. build_name_lookup, which collapses a full
+    grounding_id2name description down to just the item's Name, so the
+    metric checks "predicted the correct game" rather than requiring an
+    exact match on genres/blurb text too. Entries missing from the lookup
+    are left as-is (defensive; every trie-constrained candidate and every
+    real target should already be present).
+
+    `max_new_tokens` (default 32) is plenty for the sid-output tasks -- a
+    semantic ID is always exactly 6 tokens -- but far too small for
+    grounding_id2name/asy's name+genres(+blurb) targets, which can run to
+    ~90+ tokens once the blurb is included. Too small a value here doesn't
+    just truncate the text -- it can cut generation off *before* the model
+    reaches any trie-valid stopping point, producing a candidate that
+    never matches any real catalog entry regardless of whether the model
+    "knew" the right answer. Callers evaluating a name_trie task should
+    pass a larger value (see run()).
+    """
     per_k_recall = {k: [] for k in K_VALUES}
     per_k_ndcg = {k: [] for k in K_VALUES}
 
@@ -110,11 +149,16 @@ def evaluate_task(
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         candidates = constrained_beam_search(
             model, tokenizer, prompt, trie, num_beams=num_beams, temperature=temperature,
+            max_new_tokens=max_new_tokens,
         )
+        target = ex["output"]
+        if result_lookup is not None:
+            candidates = [result_lookup.get(c, c) for c in candidates]
+            target = result_lookup.get(target, target)
 
         for k in K_VALUES:
-            per_k_recall[k].append(recall_at_k(candidates, ex["output"], k))
-            per_k_ndcg[k].append(ndcg_at_k(candidates, ex["output"], k))
+            per_k_recall[k].append(recall_at_k(candidates, target, k))
+            per_k_ndcg[k].append(ndcg_at_k(candidates, target, k))
 
         if (i + 1) % 5 == 0:
             logger.info("  ...%d/%d examples", i + 1, len(examples))
@@ -184,6 +228,7 @@ def run(
     name_trie = build_name_trie(tokenizer, catalog)
     tries = {"sid": sid_trie, "name": name_trie}
     sid_criteria_lookup = build_sid_criteria_lookup(catalog)
+    name_lookup = build_name_lookup(catalog)
 
     examples_by_task = load_val_examples_by_task(data_path)
     num_beams = max(K_VALUES)
@@ -203,6 +248,11 @@ def run(
         if task == "nl_preference":
             results[task] = evaluate_nl_preference_task(
                 model, tokenizer, tries[trie_kind], sample, num_beams, sid_criteria_lookup, temperature=temperature,
+            )
+        elif task in NAME_ONLY_TASKS:
+            results[task] = evaluate_task(
+                model, tokenizer, tries[trie_kind], sample, num_beams, temperature=temperature,
+                result_lookup=name_lookup, max_new_tokens=NAME_TASK_MAX_NEW_TOKENS,
             )
         else:
             results[task] = evaluate_task(model, tokenizer, tries[trie_kind], sample, num_beams, temperature=temperature)

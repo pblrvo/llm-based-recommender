@@ -128,6 +128,26 @@ def item_description(name: str, genres: Optional[str], about_the_game: Optional[
     return desc
 
 
+def build_name_lookup(catalog: pl.DataFrame) -> Dict[str, str]:
+    """Build an item-description string -> plain item Name lookup, covering
+    both the short "Name — Genres" form (asy's real target) and the
+    blurb-enriched long form (grounding_id2name's real target) -- see
+    build_name_trie's docstring for why both need to resolve.
+
+    Lets an evaluator score "did it predict the correct game" independent
+    of whether it also reproduced genres/blurb text exactly -- map both a
+    beam-search candidate and the target through this before calling
+    recall_at_k/ndcg_at_k.
+    """
+    lookup = {}
+    for row in catalog.iter_rows(named=True):
+        short_desc = item_description(row["Name"], row["Genres"])
+        long_desc = item_description(row["Name"], row["Genres"], row["About the game"])
+        lookup[short_desc] = row["Name"]
+        lookup[long_desc] = row["Name"]
+    return lookup
+
+
 def build_sid_criteria_lookup(catalog: pl.DataFrame) -> Dict[str, dict]:
     """Build a semantic-ID-string -> genres/categories lookup.
 
@@ -160,19 +180,29 @@ def build_sid_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
 
 
 def build_name_trie(tokenizer, catalog: pl.DataFrame) -> Trie:
-    """Build a trie over every valid 'Name — Genres. <blurb>' description.
+    """Build a trie over every valid item description, in BOTH forms that
+    actually appear as real training targets: the plain "Name — Genres"
+    short form (asy's target) and the blurb-enriched "Name — Genres.
+    <blurb>" long form (grounding_id2name's target -- see
+    build_finetune_dataset.py's build_grounding_examples/build_
+    sequential_and_asy_examples, which draw from the same item_desc for
+    asy but only add the blurb for grounding_id2name).
 
-    Used to constrain grounding_id2name outputs. Includes the "About the
-    game" blurb since that's what the model is actually trained to produce
-    (see item_description); a trie built from the plain "Name — Genres"
-    form would force-stop generation before the blurb, guaranteeing a
-    mismatch against every val-set target.
+    Used to constrain grounding_id2name and asy outputs. Both forms are
+    inserted as valid stopping points per item (Trie.END supports a string
+    being a valid prefix of another string also in the trie) -- a trie with
+    only the long form would force asy's generation past where it's
+    actually trained to stop; a trie with only the short form would do the
+    same to grounding_id2name (guaranteeing a mismatch against every
+    val-set target either way).
     """
     trie = Trie()
     for row in catalog.iter_rows(named=True):
-        desc = item_description(row["Name"], row["Genres"], row["About the game"])
-        token_ids = tokenizer(desc, add_special_tokens=False)["input_ids"]
-        trie.insert(token_ids)
+        short_desc = item_description(row["Name"], row["Genres"])
+        long_desc = item_description(row["Name"], row["Genres"], row["About the game"])
+        for desc in {short_desc, long_desc}:
+            token_ids = tokenizer(desc, add_special_tokens=False)["input_ids"]
+            trie.insert(token_ids)
     return trie
 
 

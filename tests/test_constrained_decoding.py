@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from constrained_decoding import (
     Trie,
+    build_name_lookup,
     build_name_trie,
     build_sid_criteria_lookup,
     build_sid_trie,
@@ -272,6 +273,21 @@ def test_build_name_trie_includes_the_blurb_not_just_name_and_genres(tiny_catalo
     assert node is not None and Trie.END in node
 
 
+def test_build_name_trie_also_accepts_the_short_form_for_asy(tiny_catalog):
+    # asy's real training target is the plain "Name — Genres" short form,
+    # never the blurb -- the trie must accept that as a valid stopping
+    # point too, not just the long form grounding_id2name produces (see
+    # build_name_trie's docstring). Without this, constraining asy's
+    # generation with this trie would force it past where it's actually
+    # trained to stop.
+    tokenizer = WordTokenizer()
+    trie = build_name_trie(tokenizer, tiny_catalog)
+
+    short_form = item_description("Half-Life 2", "Action")
+    node = trie.children_of(tokenizer(short_form)["input_ids"])
+    assert node is not None and Trie.END in node
+
+
 def test_item_description_without_blurb_matches_old_short_form():
     # about_the_game=None (the default) preserves the plain "Name — Genres"
     # form for callers that don't need the blurb (e.g. the popularity
@@ -287,6 +303,44 @@ def test_item_description_appends_truncated_blurb_when_given():
 def test_item_description_omits_separator_when_blurb_is_missing():
     assert item_description("Portal 2", "Puzzle,Comedy", None) == "Portal 2 — Puzzle, Comedy"
     assert item_description("Portal 2", "Puzzle,Comedy", "") == "Portal 2 — Puzzle, Comedy"
+
+
+# ---------------------------------------------------------------------
+# build_name_lookup
+# ---------------------------------------------------------------------
+
+
+def test_build_name_lookup_maps_full_description_to_plain_name(tiny_catalog):
+    lookup = build_name_lookup(tiny_catalog)
+
+    hl2_full_desc = item_description("Half-Life 2", "Action", tiny_catalog.row(0, named=True)["About the game"])
+    portal2_full_desc = item_description("Portal 2", "Puzzle,Comedy", None)
+
+    assert lookup[hl2_full_desc] == "Half-Life 2"
+    assert lookup[portal2_full_desc] == "Portal 2"
+
+
+def test_build_name_lookup_also_maps_the_short_form_for_asy(tiny_catalog):
+    # asy's real target is the short "Name — Genres" form, distinct from
+    # grounding_id2name's blurb-enriched target for items that have a
+    # blurb (Half-Life 2 here) -- both must resolve to the same Name.
+    lookup = build_name_lookup(tiny_catalog)
+    hl2_short_desc = item_description("Half-Life 2", "Action")
+    assert lookup[hl2_short_desc] == "Half-Life 2"
+
+
+def test_build_name_lookup_collapses_duplicate_names_to_the_same_value(tiny_catalog):
+    # Two different catalog rows sharing a Name (e.g. a re-released title)
+    # must both map to that same Name -- the point of this lookup is to
+    # score "predicted the correct game", and duplicate-named rows are
+    # indistinguishable from the model's perspective once decoded. Checked
+    # via the set of Name values (not raw key count), since each item can
+    # legitimately contribute up to 2 distinct description-string keys
+    # (short + long form) without that affecting how many distinct games
+    # the lookup actually resolves to.
+    duped = pl.concat([tiny_catalog, tiny_catalog.head(1)])
+    lookup = build_name_lookup(duped)
+    assert set(lookup.values()) == {"Half-Life 2", "Portal 2"}
 
 
 # ---------------------------------------------------------------------
