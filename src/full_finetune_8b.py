@@ -27,13 +27,12 @@ Optimizer is 8-bit AdamW (bitsandbytes, already a project dependency) --
 the lever that keeps 8B full fine-tuning inside a single 80GB GPU's memory
 instead of needing multi-GPU FSDP.
 
-Batch size, gradient checkpointing memory headroom, and realistic
-steps/second have NOT been smoke-tested on real 8B-scale hardware (this
-project's other configs each cite specific measured numbers from a smoke
-test on the target GPU -- see e.g. qlora_finetune.py's lora_r comment).
-Run a short smoke test (a few hundred steps) on the actual RunPod instance
-before committing to a full run, and adjust micro_batch_size/
-gradient_accumulation_steps if memory is tighter or looser than expected.
+Batch size was smoke-tested on the actual RunPod A100 80GB PCIe (see
+FullFineTuneConfig.micro_batch_size) -- micro_batch=8/grad_accum=16 measured
+at ~58GB/82GB steady-state, ~7.5-8s/optimizer step. Observed throughput
+(~914 tok/s at micro_batch=4; better at micro_batch=8) is well under naive
+FLOP-based estimates -- if re-estimating training time/cost, use the
+measured per-step timing here, not a theoretical tok/s figure.
 """
 
 from dataclasses import dataclass
@@ -74,13 +73,13 @@ class FullFineTuneConfig:
     max_seq_length: int = 192
 
     # Effective batch = micro_batch_size * gradient_accumulation_steps.
-    # NOT smoke-tested (see module docstring) -- this project's other
-    # per-stage defaults were each set from a measured OOM/near-OOM point
-    # on the target GPU; this one is a reasoned starting guess for an 80GB
-    # card with full-parameter gradients + activations at a short (192-
-    # token) sequence length, not a measured one. Validate on RunPod first.
-    micro_batch_size: int = 4
-    gradient_accumulation_steps: int = 32  # effective batch 128, matching this project's existing convention
+    # Smoke-tested on the actual RunPod A100 80GB PCIe: micro_batch=4 used
+    # 54GB/82GB steady-state at ~9s/optimizer step; micro_batch=8 (this
+    # config) used 58GB/82GB (71%, still comfortable headroom) at a steadier
+    # ~7.5-8s/step -- ~13% faster for the same effective batch, so worth the
+    # extra ~4GB. Both were measured with gradient_checkpointing=True.
+    micro_batch_size: int = 8
+    gradient_accumulation_steps: int = 16  # effective batch 128, matching this project's existing convention
     num_epochs: int = 2
     max_steps: Optional[int] = None  # None -> num_epochs drives training length (budget allows full epochs now)
     learning_rate: float = 2e-5  # full-parameter LR, matches this project's own prior full_finetune.py precedent
