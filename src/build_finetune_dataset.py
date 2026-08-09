@@ -90,6 +90,7 @@ also droppable for training -- both are eval-time-only metadata.
 """
 
 import json
+import math
 import random
 import re
 from collections import Counter, defaultdict
@@ -99,6 +100,7 @@ from typing import Callable, List, Optional
 
 import polars as pl
 
+from build_relatedness_examples import build_relatedness_examples
 from config import RQVAEConfig
 from logger import Logger
 
@@ -111,30 +113,69 @@ SEQUENTIAL_INSTRUCTIONS = [
     "Given a user's game history, ordered from most to least played, predict the semantic ID of the next game they are likely to enjoy.",
     "Here is a list of games a player has spent time on, from most to least played. What game's semantic ID would you recommend next?",
     "Based on this player's play history (most engaged first), predict the semantic ID of a game they would likely enjoy next.",
+    "This player's games are listed from most to least played. Predict the semantic ID of what they'll play next.",
+    "Looking at this engagement-ordered play history, what semantic ID would you recommend next?",
+    "Given the games below (most played first), output the semantic ID of the next game for this player.",
+    "A player's history is shown ranked by engagement. Predict their next game's semantic ID.",
+    "Using this player's most-to-least-played game list, forecast the semantic ID of their next pick.",
+    "Here's what this player has played, ranked by time invested. What's the semantic ID of a game they'd play next?",
+    "From this ranked play history, infer the semantic ID of the next game this player would enjoy.",
+    "This is a player's game history in order of engagement. Give the semantic ID of your next recommendation.",
+    "Predict the next game's semantic ID for a player with this play history (most engaged first).",
 ]
 
 ASY_INSTRUCTIONS = [
     "Given a user's game history, ordered from most to least played, predict the name of the next game they are likely to enjoy.",
     "Here is a list of games a player has spent time on, from most to least played. What game would you recommend next? Tell me its name.",
     "Based on this player's play history (most engaged first), predict the title of a game they would likely enjoy next.",
+    "This player's games are listed from most to least played. Name the next game they'll likely play.",
+    "Looking at this engagement-ordered play history, which game would you recommend next? Give its name.",
+    "Given the games below (most played first), name the next game for this player.",
+    "A player's history is shown ranked by engagement. Predict the name of their next game.",
+    "Using this player's most-to-least-played game list, name your next recommendation.",
+    "Here's what this player has played, ranked by time invested. What game should they play next?",
+    "From this ranked play history, name the next game this player would enjoy.",
+    "This is a player's game history in order of engagement. Give the title of your next recommendation.",
+    "Predict the name of the next game for a player with this play history (most engaged first).",
 ]
 
 ID_TO_NAME_INSTRUCTIONS = [
     "What game does this semantic ID represent?",
     "Identify the game corresponding to this semantic ID.",
     "Which game is encoded by this semantic ID?",
+    "Decode this semantic ID into the game it stands for.",
+    "Tell me the name of the game behind this semantic ID.",
+    "This semantic ID maps to a specific game. Which one?",
+    "Translate this semantic ID back into a game name.",
+    "What is this semantic ID's corresponding game?",
+    "Given this semantic ID, name the game it identifies.",
+    "Look up the game associated with this semantic ID.",
 ]
 
 NAME_TO_ID_INSTRUCTIONS = [
     "What is the semantic ID for this game?",
     "Give the semantic ID that represents this game.",
     "Encode this game as its semantic ID.",
+    "Convert this game into its semantic ID.",
+    "Look up the semantic ID for this game.",
+    "This game has a corresponding semantic ID. What is it?",
+    "Translate this game's name into its semantic ID.",
+    "Identify the semantic ID that encodes this game.",
+    "What semantic ID does this game map to?",
+    "Provide the semantic ID for the following game.",
 ]
 
 SIMILAR_INSTRUCTIONS = [
     "A player enjoyed this game. Suggest another game they would likely also enjoy.",
     "Given a game a player liked, recommend a similar game.",
     "Players who played this game also played the following game. Name it by semantic ID.",
+    "This game was a hit with a player. What similar game's semantic ID would you suggest?",
+    "Recommend, by semantic ID, a game similar to the one below.",
+    "A player liked this game a lot. Give the semantic ID of something similar.",
+    "Based on this game, suggest another one real players also enjoyed. Give its semantic ID.",
+    "What game's semantic ID would you pair with this one for a similar player?",
+    "Given this game a player enjoyed, what's a good next pick? Answer with its semantic ID.",
+    "Suggest, by semantic ID, a game that fans of this one also tend to like.",
 ]
 
 # nl_preference: open-ended natural-language preference queries -> a real
@@ -148,6 +189,12 @@ NL_QUERY_INSTRUCTIONS = [
     "A player describes what kind of game they want to play. Recommend a matching game by its semantic ID.",
     "Based on this player's request, suggest a game that fits by giving its semantic ID.",
     "Given the following game preference, recommend a matching game's semantic ID.",
+    "A player states what they're in the mood for. Give the semantic ID of a game that matches.",
+    "Read this player's preference and respond with a matching game's semantic ID.",
+    "This player wants a specific kind of game. Recommend one by semantic ID.",
+    "Match this game request to a real catalog item. Answer with its semantic ID.",
+    "Given what this player is looking for, suggest a fitting game's semantic ID.",
+    "A player's game preference is described below. Give the semantic ID of a suitable match.",
 ]
 
 # {article} is "a"/"an" computed for {genre} (or {genre1}) by
@@ -161,12 +208,23 @@ GENRE_QUERY_TEMPLATES = [
     "I'm looking for something in the {genre} genre.",
     "Suggest a good {genre} game to play.",
     "Can you recommend {article} {genre} game?",
+    "Got any {genre} games worth playing?",
+    "I'm in the mood for {article} {genre} game.",
+    "What's a solid {genre} game I could try?",
+    "I feel like playing {article} {genre} game right now.",
+    "Any suggestions for {article} {genre} game?",
+    "Point me to {article} {genre} game.",
+    "Show me a {genre} game I might like.",
 ]
 
 GENRE_COMBO_QUERY_TEMPLATES = [
     "I want to play {article1} {genre1} {genre2} game.",
     "Recommend a game that's both {genre1} and {genre2}.",
     "Looking for {article1} {genre1}/{genre2} game recommendation.",
+    "Got any games that mix {genre1} and {genre2}?",
+    "I want something that's {genre1} and {genre2} at the same time.",
+    "Suggest {article1} {genre1}-{genre2} game.",
+    "What's a good {genre1} and {genre2} crossover game?",
 ]
 
 CATEGORY_QUERY_TEMPLATES = [
@@ -174,6 +232,10 @@ CATEGORY_QUERY_TEMPLATES = [
     "Recommend {article} {genre} game that supports {category}.",
     "Looking for a {category} {genre} game.",
     "I want {article} {genre} game I can play {category}.",
+    "Suggest {article} {genre} game with {category} support.",
+    "Any {category} {genre} games you'd recommend?",
+    "I'm after {article} {genre} game with {category}.",
+    "Got a {category} {genre} game in mind?",
 ]
 
 # Curated: only categories a real user would actually phrase a preference
@@ -206,6 +268,10 @@ MAX_BLURB_WORDS = 30
 NL_SIMILAR_INSTRUCTIONS = [
     "A player enjoyed a game and describes it by name. Recommend a similar game by its semantic ID.",
     "Given the name of a game a player liked, suggest a similar game's semantic ID.",
+    "A player names a game they liked. Give the semantic ID of something similar.",
+    "This player enjoyed the named game. Recommend a similar one by semantic ID.",
+    "Based on the game named below, suggest a similar game's semantic ID.",
+    "A player liked this game (given by name). What similar game's semantic ID fits?",
 ]
 
 SIMILAR_NL_TEMPLATES = [
@@ -214,6 +280,12 @@ SIMILAR_NL_TEMPLATES = [
     "What's a good game similar to {item_name}?",
     "Suggest something similar to {item_name}.",
     "I enjoyed {item_name}. What should I play next?",
+    "Give me something in the same vein as {item_name}.",
+    "If I liked {item_name}, what else would I enjoy?",
+    "Got anything like {item_name}?",
+    "{item_name} was great. What's similar?",
+    "I'm looking for a game similar to {item_name}.",
+    "What would you recommend to someone who loved {item_name}?",
 ]
 
 
@@ -262,8 +334,21 @@ class AlpacaDatasetBuilder:
         # build_nl_preference_examples -- there's no single correct target
         # for an open-ended query, so this controls answer diversity, not
         # a floor/ceiling on one item's exposure).
-        nl_examples_per_genre: int = 20,
-        nl_examples_per_combo: int = 10,
+        # Was 20/10. nl_preference was badly underusing real headroom: only
+        # 20 of up to 5,399 qualifying items per genre (Indie) were ever
+        # shown, despite each one being a genuinely different real
+        # (query, target) pair, not a repeat -- unlike padding sequential/
+        # similar_item further, this costs nothing in quality. 150 stays
+        # under the smallest qualifying genre's pool (Massively
+        # Multiplayer, 212 items), so no genre needs repeats to hit it.
+        nl_examples_per_genre: int = 150,
+        nl_examples_per_combo: int = 40,
+        # relatedness: positive+negative pairs generated per item (see
+        # build_relatedness_examples.py). Not a floor/ceiling -- every item
+        # gets exactly this many of each, since ground truth (shared level-0
+        # code) is cheap to compute for any item, unlike grounding/similar's
+        # real-data-limited pools.
+        relatedness_examples_per_item: int = 3,
         # Cap on an item's TOTAL appearance as a target, summed across every
         # recommendation-shaped task (sequential/asy/similar_item/
         # nl_similar_item/nl_preference) -- see _cap_total_exposure_across_
@@ -295,6 +380,7 @@ class AlpacaDatasetBuilder:
         self.grounding_repeat_floor = grounding_repeat_floor
         self.nl_examples_per_genre = nl_examples_per_genre
         self.nl_examples_per_combo = nl_examples_per_combo
+        self.relatedness_examples_per_item = relatedness_examples_per_item
         self.max_total_recommendation_exposure = max_total_recommendation_exposure
         self.sequential_target_floor = sequential_target_floor
         self.sequential_target_ceiling = sequential_target_ceiling
@@ -311,6 +397,7 @@ class AlpacaDatasetBuilder:
         self.item_genres: dict = {}     # id -> {genre, ...} (raw catalog Genres, set-valued)
         self.item_categories: dict = {}  # id -> {category, ...} (raw catalog Categories, set-valued)
         self.item_blurb: dict = {}      # id -> short (<= MAX_BLURB_WORDS-word) snippet of "About the game"
+        self.item_codes: dict = {}      # id -> tuple(level codes), e.g. (89, 210, 246, 0) -- for the relatedness task
 
     # ------------------------------------------------------------------
     # Setup
@@ -363,6 +450,7 @@ class AlpacaDatasetBuilder:
         for row in joined.iter_rows(named=True):
             item_id = row["id"]
             self.item_tokens[item_id] = self.semantic_id_to_tokens(row["semantic_ids"])
+            self.item_codes[item_id] = tuple(row["semantic_ids"])
             self.item_name[item_id] = row["Name"]
             genres = row["Genres"].replace(",", ", ") if row["Genres"] else None
             self.item_desc[item_id] = f"{row['Name']} — {genres}" if genres else row["Name"]
@@ -371,6 +459,24 @@ class AlpacaDatasetBuilder:
             self.item_blurb[item_id] = self._truncate_blurb(row["About the game"])
 
         logger.info("Indexed %d items", len(self.item_tokens))
+
+    def _played_sequence(self, row: dict) -> List:
+        """Item IDs from `row`, restricted to played items (nonzero playtime) known to the catalog.
+
+        ~24.8% of a typical user's owned items have zero recorded playtime
+        (owned but never opened -- bundles, free weekends, gifting; see the
+        Stage 0 notebook's Part B.5). Sequences are sorted by playtime
+        descending, so these sit in an arbitrary-order tail at the end --
+        including them as a history item or, worse, a prediction target
+        teaches the model to predict games the user never actually engaged
+        with. Filtering here, once, keeps sequential/asy/similar_item/
+        nl_similar_item all consistent.
+        """
+        return [
+            item_id
+            for item_id, playtime in zip(row["item_sequence"], row["playtime_sequence"])
+            if playtime > 0 and item_id in self.item_tokens
+        ]
 
     # ------------------------------------------------------------------
     # Rebalancing
@@ -450,7 +556,13 @@ class AlpacaDatasetBuilder:
     # ------------------------------------------------------------------
 
     def _build_history_target_pairs(self) -> List[tuple]:
-        """Build shared (history_item_ids, target_item_id) pairs for sequential + asy."""
+        """Build shared (history_item_ids, target_item_id, is_synthetic) pairs for sequential + asy.
+
+        `is_synthetic` is False for every row unless sequences_path points at
+        a combined file produced by build_synthetic_sequences.py (which
+        tags its rows with an is_synthetic column) -- see build_all(),
+        which keeps every synthetic-tagged example out of val.
+        """
         pairs = []
         skipped_users = 0
 
@@ -459,10 +571,11 @@ class AlpacaDatasetBuilder:
                 skipped_users += 1
                 continue
 
-            sequence = [i for i in row["item_sequence"] if i in self.item_tokens]
+            sequence = self._played_sequence(row)
             if len(sequence) < 2:
                 continue
 
+            is_synthetic = row.get("is_synthetic", False)
             positions = list(range(1, len(sequence)))
             if len(positions) > self.max_examples_per_user:
                 positions = sorted(self.rng.sample(positions, self.max_examples_per_user))
@@ -470,7 +583,7 @@ class AlpacaDatasetBuilder:
             for pos in positions:
                 history = sequence[max(0, pos - self.max_history_items):pos]
                 target = sequence[pos]
-                pairs.append((history, target))
+                pairs.append((history, target, is_synthetic))
 
         logger.info("Built %d history/target pairs (skipped %d long-tail users)", len(pairs), skipped_users)
         return pairs
@@ -478,7 +591,7 @@ class AlpacaDatasetBuilder:
     def build_sequential_and_asy_examples(self, pairs: List[tuple]) -> tuple:
         """Render shared history->target pairs as both a sequential and an asy example."""
         sequential, asy = [], []
-        for history, target in pairs:
+        for history, target, is_synthetic in pairs:
             history_tokens = " ".join(self.item_tokens[i] for i in history)
             sequential.append({
                 "instruction": self.rng.choice(SEQUENTIAL_INSTRUCTIONS),
@@ -486,6 +599,7 @@ class AlpacaDatasetBuilder:
                 "output": self.item_tokens[target],
                 "task": "sequential",
                 "_target": target,
+                "_synthetic": is_synthetic,
             })
             asy.append({
                 "instruction": self.rng.choice(ASY_INSTRUCTIONS),
@@ -493,6 +607,7 @@ class AlpacaDatasetBuilder:
                 "output": self.item_desc[target],
                 "task": "asy",
                 "_target": target,
+                "_synthetic": is_synthetic,
             })
         return sequential, asy
 
@@ -525,33 +640,64 @@ class AlpacaDatasetBuilder:
         return id2name, name2id
 
     def _compute_similar_partners(self) -> dict:
-        """Compute top co-occurring partner(s) per item, symmetric across all items."""
+        """Compute top co-occurring partner(s) per item, ranked by PMI (not raw co-occurrence count).
+
+        Raw co-occurrence favors popular items regardless of real affinity
+        -- two blockbusters co-occur constantly just because most users own
+        both, independent of how similar they actually are. Pointwise
+        mutual information normalizes each pair's co-occurrence by both
+        items' individual frequency, so a pair only ranks highly when they
+        co-occur *more than* their popularity alone would predict. Measured
+        on the raw-count version: co-occurring pairs shared a semantic-ID
+        level-0 code only ~6.8% of the time, barely above a 1.1% random
+        baseline -- weak evidence the old ranking reflected genuine
+        similarity rather than mutual popularity.
+
+        Rows tagged `is_synthetic` (from build_synthetic_sequences.py's
+        k-NN walks) are skipped entirely -- those walks are themselves
+        built from embedding similarity, so treating their co-occurrence
+        as evidence of similarity would be circular. Synthetic rows exist
+        to top up sequential/asy's exposure only.
+        """
         logger.info(
             "Computing item co-occurrence (window=%d, min_count=%d)...",
             self.cooccurrence_window, self.min_cooccurrence,
         )
         cooccurrence = Counter()
+        item_frequency = Counter()
+        n_sequences = 0
         skipped_users = 0
+        skipped_synthetic = 0
 
         for row in self.sequences_df.iter_rows(named=True):
             if self.exclude_long_tail_users and row["is_long_tail_user"]:
                 skipped_users += 1
                 continue
+            if row.get("is_synthetic", False):
+                skipped_synthetic += 1
+                continue
 
-            items = [i for i in row["item_sequence"][: self.cooccurrence_window] if i in self.item_tokens]
+            items = sorted(set(self._played_sequence(row)[: self.cooccurrence_window]))
             if len(items) < 2:
                 continue
-            for a, b in combinations(sorted(set(items)), 2):
+            n_sequences += 1
+            item_frequency.update(items)
+            for a, b in combinations(items, 2):
                 cooccurrence[(a, b)] += 1
 
-        logger.info("Found %d co-occurring item pairs (skipped %d long-tail users)", len(cooccurrence), skipped_users)
+        logger.info(
+            "Found %d co-occurring item pairs across %d qualifying sequences "
+            "(skipped %d long-tail users, %d synthetic rows)",
+            len(cooccurrence), n_sequences, skipped_users, skipped_synthetic,
+        )
 
         partners: dict = {}
         for (a, b), count in cooccurrence.items():
             if count < self.min_cooccurrence:
                 continue
-            partners.setdefault(a, []).append((b, count))
-            partners.setdefault(b, []).append((a, count))
+            pmi = math.log((count * n_sequences) / (item_frequency[a] * item_frequency[b]))
+            partners.setdefault(a, []).append((b, pmi))
+            partners.setdefault(b, []).append((a, pmi))
         return partners
 
     def build_similar_examples(self, partners: dict) -> List[dict]:
@@ -559,7 +705,7 @@ class AlpacaDatasetBuilder:
         examples = []
         for item_id, candidates in partners.items():
             candidates.sort(key=lambda x: x[1], reverse=True)
-            for partner_id, _count in candidates[: self.max_similar_per_item]:
+            for partner_id, _pmi in candidates[: self.max_similar_per_item]:
                 examples.append({
                     "instruction": self.rng.choice(SIMILAR_INSTRUCTIONS),
                     "input": self.item_tokens[item_id],
@@ -580,7 +726,7 @@ class AlpacaDatasetBuilder:
         for item_id, candidates in partners.items():
             candidates.sort(key=lambda x: x[1], reverse=True)
             item_name = self.item_name[item_id]
-            for partner_id, _count in candidates[: self.max_similar_per_item]:
+            for partner_id, _pmi in candidates[: self.max_similar_per_item]:
                 query = self.rng.choice(SIMILAR_NL_TEMPLATES).format(item_name=item_name)
                 examples.append({
                     "instruction": self.rng.choice(NL_SIMILAR_INSTRUCTIONS),
@@ -765,6 +911,22 @@ class AlpacaDatasetBuilder:
             train.extend(group[n_val:])
         return train, val
 
+    @staticmethod
+    def _exclude_synthetic_from_val(train: List[dict], val: List[dict]) -> tuple:
+        """Move any `_synthetic`-tagged example out of val and into train.
+
+        Group-based splitting moves a whole target's group to val at once,
+        so a group can contain both real and synthetic examples for the
+        same under-exposed item -- eval should only ever measure real user
+        behavior (see build_synthetic_sequences.py).
+        """
+        leaked_synthetic = [ex for ex in val if ex.get("_synthetic")]
+        if not leaked_synthetic:
+            return train, val
+        val = [ex for ex in val if not ex.get("_synthetic")]
+        train = train + leaked_synthetic
+        return train, val
+
     def build_all(self) -> dict:
         """Run the full pipeline: load data, build per-task examples, rebalance, split, and write JSONL."""
         self.load_data()
@@ -793,6 +955,18 @@ class AlpacaDatasetBuilder:
 
         nl_preference = self.build_nl_preference_examples()
 
+        # relatedness: ground truth is the codebook structure itself (shared
+        # level-0 code), not real usage data, so it isn't subject to the
+        # real-data-availability limits similar_item/grounding have -- no
+        # floor/ceiling rebalancing needed, every item gets the same count.
+        # Excluded from the cross-task exposure cap below for the same
+        # reason grounding is: not a popularity-biased recommendation
+        # target, so nothing to cap.
+        relatedness = build_relatedness_examples(
+            self.item_codes, self.item_tokens, self.relatedness_examples_per_item, self.rng,
+        )
+        logger.info("Built %d relatedness examples", len(relatedness))
+
         # Cap TOTAL exposure per item across the recommendation-shaped
         # tasks combined (see _cap_total_exposure_across_tasks) -- each
         # task's own ceiling bounds it alone, but an item can independently
@@ -814,6 +988,7 @@ class AlpacaDatasetBuilder:
             "similar_item": recommendation_tasks["similar_item"],
             "nl_similar_item": recommendation_tasks["nl_similar_item"],
             "nl_preference": recommendation_tasks["nl_preference"],
+            "relatedness": relatedness,
         }
 
         # grounding tasks: split WITHIN each item's group so every item is
@@ -830,6 +1005,7 @@ class AlpacaDatasetBuilder:
         for name, examples in tasks.items():
             split_fn = split_fn_by_task.get(name, self.train_val_split_by_group)
             train, val = split_fn(examples)
+            train, val = self._exclude_synthetic_from_val(train, val)
             train_all.extend(train)
             val_all.extend(val)
             logger.info("%s: %d train, %d val", name, len(train), len(val))
@@ -837,9 +1013,11 @@ class AlpacaDatasetBuilder:
         self.rng.shuffle(train_all)
         self.rng.shuffle(val_all)
 
-        # "_target" is an internal grouping key, not part of the Alpaca schema.
+        # Leading-underscore keys ("_target", relatedness's "_label", ...) are
+        # internal bookkeeping, not part of the Alpaca schema.
         for ex in train_all + val_all:
-            del ex["_target"]
+            for key in [k for k in ex if k.startswith("_")]:
+                del ex[key]
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         train_path = self.output_dir / "sft_train.jsonl"
@@ -894,6 +1072,17 @@ class AlpacaDatasetBuilder:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--sequences-path", type=Path, default=None,
+        help="Defaults to data/clean_user_sequences.parquet (real-only). Point this at "
+             "data/combined_user_sequences.parquet (see build_synthetic_sequences.py) to "
+             "include the synthetic sequential top-up.",
+    )
+    args = parser.parse_args()
+
     config = RQVAEConfig()
-    builder = AlpacaDatasetBuilder(config)
+    builder = AlpacaDatasetBuilder(config, sequences_path=args.sequences_path)
     builder.build_all()

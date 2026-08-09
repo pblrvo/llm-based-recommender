@@ -87,23 +87,36 @@ NAME_TASK_MAX_NEW_TOKENS = 96
 
 
 def load_model(adapter_path: Path):
-    """Load the Qwen3-4B base model in 4-bit and attach the LoRA adapter at `adapter_path`.
+    """Load a fine-tuned model for eval, auto-detecting adapter vs. full-parameter format.
+
+    `adapter_path` may point at either:
+      - a QLoRA adapter directory (has adapter_config.json) -- reattached to
+        a fresh 4-bit BASE_MODEL_NAME, the original qlora_finetune.py path.
+      - a complete full-parameter fine-tuned model directory (no
+        adapter_config.json, e.g. full_finetune_8b.py's output) -- loaded
+        directly, no base model or quantization involved.
 
     Returns:
         (model, tokenizer) pair, ready for `eval()`.
     """
     tokenizer = AutoTokenizer.from_pretrained(adapter_path)
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True, llm_int8_skip_modules=["lm_head"],
-    )
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME, dtype=torch.bfloat16, quantization_config=quantization_config,
-    )
-    base_model.resize_token_embeddings(len(tokenizer))
-    model = PeftModel.from_pretrained(base_model, adapter_path)
+
+    if (Path(adapter_path) / "adapter_config.json").exists():
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True, llm_int8_skip_modules=["lm_head"],
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_NAME, dtype=torch.bfloat16, quantization_config=quantization_config,
+        )
+        base_model.resize_token_embeddings(len(tokenizer))
+        model = PeftModel.from_pretrained(base_model, adapter_path)
+        logger.info("Model + adapter loaded from %s", adapter_path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(adapter_path, dtype=torch.bfloat16)
+        logger.info("Full-parameter model loaded from %s", adapter_path)
+
     model.eval()
-    logger.info("Model + adapter loaded from %s", adapter_path)
     return model, tokenizer
 
 

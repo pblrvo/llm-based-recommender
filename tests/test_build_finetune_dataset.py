@@ -507,6 +507,7 @@ def test_compute_similar_partners_and_nl_similar_examples():
     builder.item_name = {"x": "Game X", "y": "Game Y", "z": "Game Z"}
     builder.sequences_df = pl.DataFrame({
         "item_sequence": [["x", "y", "z"], ["x", "y"]],
+        "playtime_sequence": [[300, 200, 100], [300, 200]],
         "is_long_tail_user": [False, False],
     })
 
@@ -520,3 +521,156 @@ def test_compute_similar_partners_and_nl_similar_examples():
         assert ex["task"] == "nl_similar_item"
         assert any(name in ex["input"] for name in item_names)  # input references a real item's name
         assert ex["output"] in builder.item_tokens.values()
+
+
+def test_played_sequence_drops_zero_playtime_items():
+    """Zero-playtime (owned, never opened) items must not become history/target/co-occurrence data."""
+    builder = make_builder(seed=0)
+    builder.item_tokens = {"x": "<sid-x>", "y": "<sid-y>", "z": "<sid-z>"}
+    row = {"item_sequence": ["x", "y", "z"], "playtime_sequence": [300, 0, 100]}
+
+    assert builder._played_sequence(row) == ["x", "z"]
+
+
+def test_played_sequence_drops_items_outside_the_catalog():
+    builder = make_builder(seed=0)
+    builder.item_tokens = {"x": "<sid-x>"}
+    row = {"item_sequence": ["x", "unknown_item"], "playtime_sequence": [300, 300]}
+
+    assert builder._played_sequence(row) == ["x"]
+
+
+def test_history_target_pairs_carry_synthetic_flag():
+    import polars as pl
+
+    builder = make_builder(seed=0)
+    builder.item_tokens = {"x": "<sid-x>", "y": "<sid-y>", "z": "<sid-z>"}
+    builder.sequences_df = pl.DataFrame({
+        "item_sequence": [["x", "y"], ["x", "z"]],
+        "playtime_sequence": [[300, 200], [300, 200]],
+        "is_long_tail_user": [False, False],
+        "is_synthetic": [False, True],
+    })
+
+    pairs = builder._build_history_target_pairs()
+    flags = {target: is_synthetic for _, target, is_synthetic in pairs}
+    assert flags["y"] is False
+    assert flags["z"] is True
+
+
+def test_history_target_pairs_default_to_not_synthetic_when_column_absent():
+    """Real-only sequences_df (no is_synthetic column) must not crash or mislabel."""
+    import polars as pl
+
+    builder = make_builder(seed=0)
+    builder.item_tokens = {"x": "<sid-x>", "y": "<sid-y>"}
+    builder.sequences_df = pl.DataFrame({
+        "item_sequence": [["x", "y"]],
+        "playtime_sequence": [[300, 200]],
+        "is_long_tail_user": [False],
+    })
+
+    pairs = builder._build_history_target_pairs()
+    assert all(is_synthetic is False for _, _, is_synthetic in pairs)
+
+
+def test_synthetic_rows_excluded_from_similar_partners():
+    import polars as pl
+
+    builder = make_builder(seed=0, min_cooccurrence=1, max_similar_per_item=5)
+    builder.item_tokens = {"x": "<sid-x>", "y": "<sid-y>"}
+    builder.item_name = {"x": "Game X", "y": "Game Y"}
+    builder.sequences_df = pl.DataFrame({
+        "item_sequence": [["x", "y"]],
+        "playtime_sequence": [[300, 200]],
+        "is_long_tail_user": [False],
+        "is_synthetic": [True],  # entirely manufactured co-occurrence
+    })
+
+    partners = builder._compute_similar_partners()
+    assert partners == {}
+
+
+def test_exclude_synthetic_from_val_moves_leaked_examples_to_train():
+    builder = make_builder(seed=0)
+    train = [{"task": "sequential", "_target": "a"}]
+    val = [
+        {"task": "sequential", "_target": "b", "_synthetic": False},
+        {"task": "sequential", "_target": "b", "_synthetic": True},
+    ]
+
+    new_train, new_val = builder._exclude_synthetic_from_val(train, val)
+
+    assert new_val == [{"task": "sequential", "_target": "b", "_synthetic": False}]
+    assert {"task": "sequential", "_target": "b", "_synthetic": True} in new_train
+    assert len(new_train) == 2
+
+
+def test_exclude_synthetic_from_val_is_a_noop_without_synthetic_examples():
+    builder = make_builder(seed=0)
+    train = [{"task": "sequential", "_target": "a"}]
+    val = [{"task": "sequential", "_target": "b"}]
+
+    new_train, new_val = builder._exclude_synthetic_from_val(train, val)
+
+    assert new_train == train
+    assert new_val == val
+
+
+def test_similar_partners_exclude_zero_playtime_items():
+    """A same-user pairing where one item was never actually played must not co-occur."""
+    import polars as pl
+
+    builder = make_builder(seed=0, min_cooccurrence=1, max_similar_per_item=5)
+    builder.item_tokens = {"x": "<sid-x>", "y": "<sid-y>"}
+    builder.item_name = {"x": "Game X", "y": "Game Y"}
+    builder.sequences_df = pl.DataFrame({
+        "item_sequence": [["x", "y"]],
+        "playtime_sequence": [[300, 0]],  # y was never played
+        "is_long_tail_user": [False],
+    })
+
+    partners = builder._compute_similar_partners()
+    assert partners == {}
+
+
+def test_similar_partners_ranked_by_pmi_not_raw_count():
+    """A rare pair that always co-occurs together must outrank a popular pair that
+    co-occurs often only because both items are independently ubiquitous.
+
+    Co-occurrence-window frequency (not raw catalog-wide popularity) is what
+    the algorithm measures, so "ubiquitous" here means paired with many
+    *different* filler partners across separate two-item sequences.
+    """
+    import polars as pl
+
+    fillers_1 = [f"f{i}" for i in range(7)]
+    fillers_2 = [f"g{i}" for i in range(7)]
+
+    builder = make_builder(seed=0, min_cooccurrence=1, max_similar_per_item=5, cooccurrence_window=30)
+    builder.item_tokens = {
+        k: f"<sid-{k}>" for k in ["a", "b", "hit1", "hit2"] + fillers_1 + fillers_2
+    }
+    builder.item_name = {k: k for k in builder.item_tokens}
+
+    sequences = []
+    # "a" and "b" are rare and always seen together (3 users, both times together).
+    sequences += [["a", "b"]] * 3
+    # "hit1"/"hit2" co-occur the same raw number of times (3), but each is also
+    # independently paired with 7 distinct filler items -- same window-frequency
+    # popularity a real blockbuster pair would have, without literally repeating
+    # the same pair (which raw co-occurrence would already catch).
+    sequences += [["hit1", "hit2"]] * 3
+    sequences += [["hit1", f] for f in fillers_1]
+    sequences += [["hit2", g] for g in fillers_2]
+
+    builder.sequences_df = pl.DataFrame({
+        "item_sequence": sequences,
+        "playtime_sequence": [[300] * len(seq) for seq in sequences],
+        "is_long_tail_user": [False] * len(sequences),
+    })
+
+    partners = builder._compute_similar_partners()
+    a_pmi = dict(partners["a"])["b"]
+    hit_pmi = dict(partners["hit1"])["hit2"]
+    assert a_pmi > hit_pmi
