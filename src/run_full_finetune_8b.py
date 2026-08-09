@@ -22,6 +22,19 @@ push, not before -- the push is cheap and reversible (re-push after fixing
 anything eval turns up), and keeping "train, save, push" as one contained
 step in full_finetune_8b.py's train() avoids splitting that responsibility
 across two files.
+
+warmup_embeddings.py imports unsloth at module level (needed for its
+load_in_4bit=True path), and unsloth monkey-patches transformers/trl at
+import time for its whole process, not just call sites that use it. Hit in
+practice: importing `run_stage2`/`run_eval` from this module (without ever
+calling `run_stage1`) still triggered Unsloth's global patching via this
+module's own top-level `from warmup_embeddings import ...`, which altered
+trl's SFTConfig `eos_token` default and broke full_finetune_8b.py's plain
+(non-Unsloth) SFTTrainer construction with `ValueError: The specified
+eos_token ('<EOS_TOKEN>') is not found in the vocabulary`. The
+`warmup_embeddings` import is local to run_stage1() below specifically so
+that calling run_stage2()/run_eval() alone -- e.g. to resume Stage 2 after
+Stage 1 already completed -- never imports unsloth at all.
 """
 
 import gc
@@ -32,7 +45,6 @@ import torch
 import evaluate_ranking_metrics
 from full_finetune_8b import FullFineTuneConfig, FullFineTuneTrainer
 from logger import Logger
-from warmup_embeddings import EmbeddingWarmupConfig, EmbeddingWarmupTrainer
 
 logger = Logger.get_logger(__name__)
 
@@ -54,6 +66,8 @@ def run_stage1():
         checkpoint -- the non-quantized path's final save_pretrained() is
         NOT a known-broken no-op, unlike the 4-bit path run_retrain.py uses).
     """
+    from warmup_embeddings import EmbeddingWarmupConfig, EmbeddingWarmupTrainer  # local: see module docstring
+
     logger.info("=== Stage 1: embedding warmup (Qwen3-8B, non-quantized) ===")
     config = EmbeddingWarmupConfig(
         base_model="Qwen/Qwen3-8B",
