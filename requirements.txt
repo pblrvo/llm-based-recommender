@@ -14,7 +14,7 @@ polars==1.42.1
 scikit-learn==1.9.0
 tqdm==4.68.3
 matplotlib==3.11.0
-
+tensorboard==2.21.0
 # LLM fine-tuning pipeline (warmup_embeddings.py, qlora_finetune.py).
 # unsloth itself is intentionally NOT listed here -- see note at the bottom.
 # These are its real runtime dependencies, installed directly so `--no-deps`

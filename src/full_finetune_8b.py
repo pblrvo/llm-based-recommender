@@ -92,6 +92,16 @@ class FullFineTuneConfig:
     save_steps: int = 300
     save_total_limit: int = 5
     eval_steps: int = 300
+    # Periodic in-training eval only needs to catch divergence early, not
+    # replace the real evaluation -- run_full_finetune_8b.py's run_eval()
+    # already runs the full, rigorous constrained-beam-search eval once
+    # training finishes. Matches evaluate_ranking_metrics.py's own n=500
+    # convention (there, 500 *per task*; here, 500 total, since this is
+    # just a coarse loss/accuracy trend signal). A smoke test measured the
+    # full 25,202-example val set taking ~6 min per eval pass -- at
+    # eval_steps=300 across a 2-epoch run that's ~19 passes, ~1.9 hours of
+    # pure eval overhead for no extra signal over a small sample.
+    eval_sample_size: int = 500
     logging_steps: int = 10
     generation_check_steps: int = 300
     seed: int = 0
@@ -227,6 +237,14 @@ class FullFineTuneTrainer:
             "Loaded local dataset from %s: %d train, %d val examples",
             cfg.train_path, len(dataset["train"]), len(dataset["validation"]),
         )
+
+        full_val_size = len(dataset["validation"])
+        if full_val_size > cfg.eval_sample_size:
+            dataset["validation"] = dataset["validation"].shuffle(seed=cfg.seed).select(range(cfg.eval_sample_size))
+            logger.info(
+                "Subsampled in-training eval set: %d -> %d examples (full val set is still used by "
+                "run_eval()'s post-training evaluation)", full_val_size, cfg.eval_sample_size,
+            )
         return dataset
 
     def build_trainer(self, dataset):
