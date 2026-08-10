@@ -84,13 +84,22 @@ K_VALUES = [5, 10]
 # produces unmatchable (truncated-before-any-trie-END) candidates rather
 # than just shorter ones.
 NAME_TASK_MAX_NEW_TOKENS = 96
-# Diverse beam search settings for the name_trie tasks only. One group per
-# beam is maximum diversity: each group is penalized for reusing tokens an
-# earlier group already picked at the same step, which is what breaks the
-# shared-prefix collapse (all 10 beams returning "Tales of Monkey Island
-# Complete Pack: Chapter N" variants). Without this, grounding_id2name
-# measured Recall@5 == Recall@10 == 7.00% exactly -- beams 6-10 wasted.
-NAME_TASK_BEAM_GROUPS = 10
+# Diverse beam search was tried for the name_trie tasks (motivation: plain
+# beam search collapses onto one franchise -- see constrained_beam_search's
+# docstring) and made things categorically worse, not better. Measured with
+# num_beam_groups=10 (one beam per group, maximum diversity) at
+# diversity_penalty=1.0: generation degenerated into a repeated single
+# character (`""""""..."`) on every sampled example. With one beam per
+# group there is no within-group search at all -- each group is penalized
+# against every other group's token choice at that position, and on this
+# constrained trie the model's natural next token kept losing that penalty
+# competition, falling into whatever low-probability trie-valid token was
+# still unpenalized. Left at num_beam_groups=1 (plain beam search) as a
+# result; a milder configuration (fewer groups, lower penalty) might still
+# help but needs its own small-scale validation before spending eval time
+# on it again, exactly like NAME_TASK_MAX_NEW_TOKENS and the pad-token fix
+# each were validated at small n before being trusted at n=500.
+NAME_TASK_BEAM_GROUPS = 1
 NAME_TASK_DIVERSITY_PENALTY = 1.0
 
 
