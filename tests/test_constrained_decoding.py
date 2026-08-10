@@ -514,3 +514,24 @@ def test_decode_handles_tokenizer_where_pad_equals_eos():
 
     tokenizer = _SameTokenTokenizer("")
     assert _strip_terminators(tokenizer, "Half-Life 2 — Action<|im_end|>") == "Half-Life 2 — Action"
+
+
+def test_diverse_beam_search_rejects_temperature_sampling():
+    """Group beam search requires do_sample=False -- the combination must fail loudly."""
+    from constrained_decoding import constrained_beam_search
+
+    with pytest.raises(ValueError, match="cannot be combined with"):
+        constrained_beam_search(
+            model=None, tokenizer=None, prompt="x", trie=Trie(), num_beams=10,
+            temperature=0.8, num_beam_groups=10,
+        )
+
+
+def test_diverse_beam_search_rejects_indivisible_group_count():
+    from constrained_decoding import constrained_beam_search
+
+    with pytest.raises(ValueError, match="divisible"):
+        constrained_beam_search(
+            model=None, tokenizer=None, prompt="x", trie=Trie(), num_beams=10,
+            num_beam_groups=3,
+        )

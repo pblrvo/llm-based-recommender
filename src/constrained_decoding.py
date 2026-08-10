@@ -283,7 +283,7 @@ def constrained_generate(
 @torch.no_grad()
 def constrained_beam_search(
     model, tokenizer, prompt: str, trie: Trie, num_beams: int, max_new_tokens: int = 32,
-    temperature: Optional[float] = None,
+    temperature: Optional[float] = None, num_beam_groups: int = 1, diversity_penalty: float = 0.0,
 ) -> List[str]:
     """Like `constrained_generate`, but return `num_beams` candidates via beam search.
 
@@ -299,6 +299,20 @@ def constrained_beam_search(
     beam-search multinomial sampling -- trades some ranking precision for
     beam diversity.
 
+    `num_beam_groups`/`diversity_penalty` enable *diverse* beam search, which
+    matters specifically for the name_trie tasks. Plain beam search over a
+    trie of ~8.5k item descriptions collapses: beams share a long prefix and
+    can't diverge, so all 10 candidates come back as near-identical variants
+    of one franchise (observed: three consecutive "Tales of Monkey Island
+    Complete Pack: Chapter N" entries). That makes Recall@10 degenerate to
+    Recall@1 -- measured as Recall@5 == Recall@10 == 7.00% exactly on
+    grounding_id2name, i.e. beams 6-10 contributed nothing. The sid_trie
+    tasks don't need this: they branch immediately on the level-0 code, and
+    show a normal Recall@10 > Recall@5 spread.
+
+    Group beam search is incompatible with sampling, so `temperature` and
+    `num_beam_groups > 1` are mutually exclusive.
+
     Args:
         model: HF causal LM.
         tokenizer: Matching HF tokenizer.
@@ -307,10 +321,23 @@ def constrained_beam_search(
         num_beams: Number of beams (and candidates returned).
         max_new_tokens: Maximum number of generated tokens per candidate.
         temperature: Sampling temperature; None means deterministic beam search.
+        num_beam_groups: >1 enables diverse beam search; must divide `num_beams`.
+        diversity_penalty: Penalty applied to tokens already chosen by earlier
+            groups at the same step. Only meaningful with `num_beam_groups > 1`.
 
     Returns:
         List of `num_beams` completion strings, best-first.
     """
+    if num_beam_groups > 1:
+        if temperature is not None:
+            raise ValueError(
+                "num_beam_groups > 1 (diverse beam search) cannot be combined with "
+                "temperature sampling -- HF's group beam search requires do_sample=False."
+            )
+        if num_beams % num_beam_groups != 0:
+            raise ValueError(
+                f"num_beams ({num_beams}) must be divisible by num_beam_groups ({num_beam_groups})."
+            )
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     prompt_len = inputs["input_ids"].shape[1]
     allowed_fn = make_prefix_allowed_tokens_fn(trie, prompt_len, tokenizer.eos_token_id)
@@ -318,6 +345,9 @@ def constrained_beam_search(
     sampling_kwargs = {"do_sample": False}
     if temperature is not None:
         sampling_kwargs = {"do_sample": True, "temperature": temperature}
+    if num_beam_groups > 1:
+        sampling_kwargs["num_beam_groups"] = num_beam_groups
+        sampling_kwargs["diversity_penalty"] = diversity_penalty
 
     output_ids = model.generate(
         **inputs,

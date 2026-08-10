@@ -84,6 +84,14 @@ K_VALUES = [5, 10]
 # produces unmatchable (truncated-before-any-trie-END) candidates rather
 # than just shorter ones.
 NAME_TASK_MAX_NEW_TOKENS = 96
+# Diverse beam search settings for the name_trie tasks only. One group per
+# beam is maximum diversity: each group is penalized for reusing tokens an
+# earlier group already picked at the same step, which is what breaks the
+# shared-prefix collapse (all 10 beams returning "Tales of Monkey Island
+# Complete Pack: Chapter N" variants). Without this, grounding_id2name
+# measured Recall@5 == Recall@10 == 7.00% exactly -- beams 6-10 wasted.
+NAME_TASK_BEAM_GROUPS = 10
+NAME_TASK_DIVERSITY_PENALTY = 1.0
 
 
 def load_model(adapter_path: Path):
@@ -139,6 +147,7 @@ def load_val_examples_by_task(val_path: Path) -> Dict[str, List[dict]]:
 def evaluate_task(
     model, tokenizer, trie: Trie, examples: List[dict], num_beams: int, temperature: Optional[float] = None,
     result_lookup: Optional[Dict[str, str]] = None, max_new_tokens: int = 32,
+    num_beam_groups: int = 1, diversity_penalty: float = 0.0,
 ) -> Dict[int, Dict[str, float]]:
     """Run constrained beam search over every example and return mean Recall@k/NDCG@k per K.
 
@@ -159,6 +168,11 @@ def evaluate_task(
     never matches any real catalog entry regardless of whether the model
     "knew" the right answer. Callers evaluating a name_trie task should
     pass a larger value (see run()).
+
+    `num_beam_groups`/`diversity_penalty` are likewise name_trie-only: plain
+    beam search over the description trie collapses all beams onto one
+    franchise, degenerating Recall@10 into Recall@1 (see
+    constrained_beam_search's docstring for the measurement).
     """
     per_k_recall = {k: [] for k in K_VALUES}
     per_k_ndcg = {k: [] for k in K_VALUES}
@@ -169,6 +183,7 @@ def evaluate_task(
         candidates = constrained_beam_search(
             model, tokenizer, prompt, trie, num_beams=num_beams, temperature=temperature,
             max_new_tokens=max_new_tokens,
+            num_beam_groups=num_beam_groups, diversity_penalty=diversity_penalty,
         )
         target = ex["output"]
         if result_lookup is not None:
@@ -272,6 +287,8 @@ def run(
             results[task] = evaluate_task(
                 model, tokenizer, tries[trie_kind], sample, num_beams, temperature=temperature,
                 result_lookup=name_lookup, max_new_tokens=NAME_TASK_MAX_NEW_TOKENS,
+                num_beam_groups=NAME_TASK_BEAM_GROUPS if temperature is None else 1,
+                diversity_penalty=NAME_TASK_DIVERSITY_PENALTY,
             )
         else:
             results[task] = evaluate_task(model, tokenizer, tries[trie_kind], sample, num_beams, temperature=temperature)
