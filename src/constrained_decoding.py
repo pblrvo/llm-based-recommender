@@ -348,6 +348,14 @@ def constrained_beam_search(
     if num_beam_groups > 1:
         sampling_kwargs["num_beam_groups"] = num_beam_groups
         sampling_kwargs["diversity_penalty"] = diversity_penalty
+        # transformers >=5 externalized group beam search to a Hub-hosted
+        # "custom generation strategy" (huggingface.co/transformers-community/
+        # group-beam-search) rather than shipping it in core -- generate()
+        # refuses to fetch it without this flag. That repo is HF's own
+        # official transformers-community org, the sanctioned mechanism this
+        # transformers version uses for optional generation strategies, not
+        # arbitrary third-party code.
+        sampling_kwargs["trust_remote_code"] = True
 
     output_ids = model.generate(
         **inputs,
