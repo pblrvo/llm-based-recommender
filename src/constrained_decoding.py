@@ -333,7 +333,25 @@ def constrained_beam_search(
     completions = []
     for seq in output_ids:
         new_tokens = seq[prompt_len:]
-        completions.append(tokenizer.decode(new_tokens, skip_special_tokens=False).replace(tokenizer.eos_token, "").strip())
+        # skip_special_tokens=False is required: the sid vocabulary
+        # (<|sid_L0_5|> etc.) IS special tokens, so skipping them would erase
+        # the answer on every sid-output task. That means both terminator
+        # tokens have to be stripped by hand -- and they are two DIFFERENT
+        # tokens here: eos is <|im_end|>, but beams that finish early are
+        # right-padded with pad_token (<|endoftext|>). Stripping only eos left
+        # trailing '<|endoftext|>' on any early-finishing beam, so the
+        # candidate never matched its name_lookup key by exact string
+        # equality. This silently zeroed the variable-length name-trie tasks
+        # (measured: asy 0.00%, grounding_id2name 4.40%) while leaving the
+        # fixed-length sid tasks untouched (they never pad, and parse_sid_codes
+        # regex-extracts rather than string-matches) -- hence the implausible
+        # 96.8% vs 4.4% gap between the two directions of the same grounding
+        # lookup, which is what surfaced the bug.
+        text = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        text = text.replace(tokenizer.eos_token, "")
+        if tokenizer.pad_token and tokenizer.pad_token != tokenizer.eos_token:
+            text = text.replace(tokenizer.pad_token, "")
+        completions.append(text.strip())
     return completions
 
 

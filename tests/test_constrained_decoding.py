@@ -452,3 +452,65 @@ def test_criteria_ndcg_at_k_decreases_with_rank():
 
 def test_criteria_ndcg_at_k_zero_when_no_match():
     assert criteria_ndcg_at_k(["sid_rpg"], {"genres": ["Action"]}, LOOKUP, k=5) == 0.0
+
+
+# ---------------------------------------------------------------------
+# constrained_beam_search decoding: terminator stripping
+# ---------------------------------------------------------------------
+
+
+class _StubTokenizerForDecode:
+    """Decodes ids back to a fixed string, with distinct eos/pad tokens.
+
+    Mirrors the real Qwen3 tokenizer's setup, where eos ('<|im_end|>') and
+    pad ('<|endoftext|>') are DIFFERENT tokens -- the condition that made
+    the padding bug only affect variable-length (name-trie) outputs.
+    """
+
+    eos_token = "<|im_end|>"
+    pad_token = "<|endoftext|>"
+    eos_token_id = 151645
+    pad_token_id = 151643
+
+    def __init__(self, decoded: str):
+        self._decoded = decoded
+
+    def decode(self, ids, skip_special_tokens: bool = False):
+        return self._decoded
+
+
+def _strip_terminators(tokenizer, raw: str) -> str:
+    """The exact stripping constrained_beam_search applies to each candidate."""
+    text = raw.replace(tokenizer.eos_token, "")
+    if tokenizer.pad_token and tokenizer.pad_token != tokenizer.eos_token:
+        text = text.replace(tokenizer.pad_token, "")
+    return text.strip()
+
+
+def test_decode_strips_pad_token_padding_from_early_finishing_beam():
+    """A beam that finishes early is right-padded with pad_token, not eos.
+
+    Regression test: stripping only eos left a trailing '<|endoftext|>' on
+    the candidate, so exact-match lookup against build_name_lookup never
+    hit -- silently zeroing the name-trie tasks.
+    """
+    tokenizer = _StubTokenizerForDecode("")
+    raw = "Worm.is: The Game — Casual, Free To Play<|im_end|><|endoftext|><|endoftext|>"
+    assert _strip_terminators(tokenizer, raw) == "Worm.is: The Game — Casual, Free To Play"
+
+
+def test_decode_leaves_sid_special_tokens_intact():
+    """sid tokens are special tokens too -- stripping terminators must not touch them."""
+    tokenizer = _StubTokenizerForDecode("")
+    raw = "<|sid_start|><|sid_L0_5|><|sid_L1_9|><|sid_end|><|im_end|><|endoftext|>"
+    assert _strip_terminators(tokenizer, raw) == "<|sid_start|><|sid_L0_5|><|sid_L1_9|><|sid_end|>"
+
+
+def test_decode_handles_tokenizer_where_pad_equals_eos():
+    """Some tokenizers set pad == eos; the extra replace must be a no-op, not a double-strip."""
+
+    class _SameTokenTokenizer(_StubTokenizerForDecode):
+        pad_token = "<|im_end|>"
+
+    tokenizer = _SameTokenTokenizer("")
+    assert _strip_terminators(tokenizer, "Half-Life 2 — Action<|im_end|>") == "Half-Life 2 — Action"
