@@ -113,7 +113,13 @@ def load_model(adapter_path: Path):
         model = PeftModel.from_pretrained(base_model, adapter_path)
         logger.info("Model + adapter loaded from %s", adapter_path)
     else:
-        model = AutoModelForCausalLM.from_pretrained(adapter_path, dtype=torch.bfloat16)
+        # device_map="cuda" matters here -- unlike the 4-bit branch above
+        # (bitsandbytes quantization implicitly requires and places on
+        # CUDA), plain from_pretrained() defaults to CPU. Missing this
+        # silently ran constrained_beam_search entirely on CPU (0% GPU
+        # utilization, ~58s/example instead of GPU speed) on the actual
+        # RunPod eval run.
+        model = AutoModelForCausalLM.from_pretrained(adapter_path, dtype=torch.bfloat16, device_map="cuda")
         logger.info("Full-parameter model loaded from %s", adapter_path)
 
     model.eval()
