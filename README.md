@@ -120,9 +120,6 @@ model learned *something*; beating this baseline shows it's actually conditionin
   LR scheduler, embed-items, constrained-decoding, build-finetune-dataset). Run with
   `.venv/bin/python -m pytest -m "not slow"`. The single `slow`-marked test loads real model + GPU
   + data files; skip it for a fast run.
-- `scratch_qualitative_eval.py` — one-off script: prints 10 sequential + 10 similar-item examples
-  with the model's top-1 beam-search prediction vs. the expected item. Reads from
-  `models/qwen3-4b-qlora-v2` (override `adapter_path` to point at your model).
 
 ## Setup
 
