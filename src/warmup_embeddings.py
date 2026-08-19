@@ -1,86 +1,22 @@
 """Stage 1 of a two-stage fine-tuning strategy: warm up the new semantic-ID
 token embeddings before any task-specific (LoRA) training happens.
 
-Why this exists: a prior single-stage run (add tokens, then immediately do
-task-specific LoRA training at a normal learning rate) converged on loss but
-never learned the actual semantic-ID content -- 0% exact-match on grounding
-tasks despite a healthy-looking eval_loss. The new tokens had to learn "what
-am I" and "how do I get used for this task" simultaneously, which is a much
-harder optimization problem than solving them separately.
+Freezes every parameter except embed_tokens/lm_head and trains only those, at
+a high learning rate, on a data sample -- giving the new tokens a
+differentiated starting point before Stage 2's real task-specific training.
+Uses codebook-grounded initialization (`_codebook_grounded_vectors`) instead
+of HF's default random init, gradient-masks the pretrained vocabulary
+(`_freeze_pretrained_vocab_gradient`) so only the new sid tokens update, and
+by default restricts the training sample to grounding tasks
+(`EmbeddingWarmupConfig.grounding_only`).
 
-This stage freezes every parameter except embed_tokens/lm_head and trains
-only those, at a high learning rate, on a data sample -- giving the new
-tokens a differentiated starting point before Stage 2 (this project's
-existing axolotl LoRA pipeline, see finetune_qwen.py) does the real
-task-specific training starting from this checkpoint instead of the raw
-base model. Approach adapted from github.com/eugeneyan/semantic-ids-llm's
-finetune_qwen3_8b_vocab.py.
-
-Two further fixes on top of that, after a full two-stage run (embedding
-warmup + rebalanced-data LoRA, then again with full fine-tuning/bigger
-batch/more epochs) still produced 0% grounding exact-match:
-
-1. Codebook-grounded initialization (see `_codebook_grounded_vectors`).
-   HF's default `resize_token_embeddings` (`mean_resizing=True`) draws every
-   new token from the *same* mean/covariance-based random distribution --
-   nothing differentiates `<|sid_L0_87|>` from `<|sid_L2_200|>` at init. Per
-   "Grounded Token Initialization for New Vocabulary in LMs for Generative
-   Recommendation" (arXiv 2604.02324), this collapses new tokens into a
-   degenerate subspace that fine-tuning struggles to fully recover
-   inter-token distinctions from. We have real trained embeddings for these
-   tokens already -- the RQ-VAE codebooks (checkpoints/rqvae_best.pt) -- so
-   there's no need to let the LLM tokens start from nothing.
-2. Full-sequence loss (`completion_only_loss=False`), matching eugeneyan's
-   recipe: sid tokens get gradient signal every time they appear, including
-   on the prompt side (history sequences, grounding_id2name's input ID),
-   not only when the model is asked to generate them.
-
-Two further fixes, informed by STAR (arXiv, "Semantic-ID Token-Embedding
-Alignment for Generative Recommenders" -- an ICLR 2026 submission that
-independently formalizes almost this exact stage, published after this
-project's own codebook-grounded init was already in place):
-
-3. Gradient-masking the pretrained vocabulary (see
-   `_freeze_pretrained_vocab_gradient`). Making embed_tokens/lm_head
-   trainable, as described above, makes the WHOLE embedding matrix
-   trainable -- not just the 1026 new sid rows. Under full-sequence loss,
-   every ordinary vocabulary token appearing in a prompt gets a real
-   gradient too, so this stage's unusually high LR (1e-3) was quietly
-   perturbing the pretrained vocabulary's embeddings alongside the new
-   tokens. STAR's whole method is built on the opposite: freeze the
-   pretrained vocabulary entirely, update only the new tokens' rows. A
-   backward hook enforces the same guarantee here without giving up
-   modules_to_save/full-matrix-requires_grad (both still needed for PEFT's
-   API and tied-embedding bookkeeping) -- see also why weight_decay
-   defaults to 0.0 now, since decoupled AdamW decay isn't gated by the
-   gradient and would otherwise still shrink the "frozen" rows.
-4. Grounding-only training sample (`EmbeddingWarmupConfig.grounding_only`).
-   STAR's ablation shows their alignment gains come specifically from
-   title/description<->Semantic-ID supervision, not from broader task
-   exposure -- so this stage's sample is restricted to grounding_id2name/
-   grounding_name2id by default instead of a mix of all 7 tasks, which
-   only diluted that one signal. Stage 2's full SFT run still covers every
-   task normally.
-
-Plain transformers/TRL by default (`load_in_4bit=False`) -- this step is
-short (~750-2250 steps) and doesn't need Unsloth's speed optimizations, and
-this project hit a tied-embeddings/target_modules pitfall with Unsloth's
-PEFT integration once before (see finetune_qwen.py's git history).
-
-For models too large to hold frozen in bf16 alongside trainable embeddings
-(e.g. Qwen3-4B, ~16GB unquantized vs. this project's 12GB GPU),
+Plain transformers/TRL by default (`load_in_4bit=False`). For models too
+large to hold frozen in bf16 alongside trainable embeddings,
 `load_in_4bit=True` switches to a quantized backbone via Unsloth's
-FastLanguageModel instead of plain transformers + bitsandbytes + peft
-directly -- the latter combination hit an unresolved dtype bug (float vs
-bfloat16 at the lm_head layer) that only reproduced inside the real
-SFTTrainer, not in any isolated test of the same pieces, pointing at a
-Trainer/accelerate internals interaction rather than anything fixable in
-this file. Unsloth maintains tested patches for exactly this scenario
-(quantized backbone + newly added trainable vocab) -- the same combination
-eugeneyan's reference project used successfully for this same purpose.
+FastLanguageModel.
 """
 
-from unsloth import FastLanguageModel, add_new_tokens  # isort: skip -- must import before transformers/trl/peft, see below
+from unsloth import FastLanguageModel, add_new_tokens  # isort: skip -- must import before transformers/trl/peft
 
 import json
 from dataclasses import dataclass
@@ -96,15 +32,9 @@ from logger import Logger
 
 logger = Logger.get_logger(__name__)
 
-# Number of RQ-VAE levels with a real trained codebook. The sid token scheme
-# has a 4th level (<|sid_L3_*|>) but it's a collision-disambiguation digit
-# added in build_finetune_dataset.py, not a learned RQ-VAE level -- almost
-# always 0, no codebook vector exists for it.
+# The 4th sid level (<|sid_L3_*|>) is a collision-disambiguation digit, not a learned RQ-VAE level.
 CODEBOOK_LEVELS = 3
 
-# Task names the EmbeddingWarmupConfig.grounding_only sample restricts to --
-# the title/description<->Semantic-ID pairs, matching STAR's alignment-stage
-# corpus (see _freeze_pretrained_vocab_gradient's docstring for the paper).
 GROUNDING_TASKS = {"grounding_id2name", "grounding_name2id"}
 
 
@@ -113,28 +43,20 @@ def _codebook_grounded_vectors(
 ) -> Dict[str, torch.Tensor]:
     """Build init vectors for the L0-L2 sid tokens from the trained RQ-VAE codebooks.
 
-    Projects each level's 32-dim codebook into the LLM embedding space with
-    a fixed isometric projection (orthonormal columns from QR-decomposing a
-    seeded random Gaussian), then rescales per level so norms land where
-    the rest of the vocabulary already lives.
-
-    The isometry (not just an approximately distance-preserving random
-    projection) is deliberate: with orthonormal columns Q,
-    ||Q v1 - Q v2|| == ||v1 - v2|| *exactly*, so the RQ-VAE codebook's
-    relative geometry -- which codes are close/far apart, and level 0's
-    meaningfully larger norm variation vs. levels 1/2's near-uniform
-    norms -- transfers into the LLM's embedding space unchanged, just
-    uniformly rescaled per level.
+    Projects each level's codebook into the LLM embedding space with a fixed
+    isometric projection (orthonormal columns from QR-decomposing a seeded
+    random Gaussian), preserving the codebook's relative geometry exactly,
+    then rescales per level so norms land where the rest of the vocabulary lives.
     """
     state_dict = torch.load(rqvae_checkpoint_path, map_location="cpu", weights_only=False)["model_state_dict"]
 
     vectors: Dict[str, torch.Tensor] = {}
     for level in range(CODEBOOK_LEVELS):
-        codebook = state_dict[f"vq_layers.{level}.embedding.weight"].float()  # (256, code_dim)
+        codebook = state_dict[f"vq_layers.{level}.embedding.weight"].float()
         num_codes, code_dim = codebook.shape
 
         projection, _ = torch.linalg.qr(torch.randn(hidden_size, code_dim, generator=generator))
-        projected = codebook @ projection.T  # (256, hidden_size), exact isometry
+        projected = codebook @ projection.T
 
         scale = target_norm / codebook.norm(dim=-1).mean()
         projected = projected * scale
@@ -153,18 +75,10 @@ def _codebook_grounded_vectors(
 def _distinct_random_vectors(
     tokens: List[str], hidden_size: int, target_norm: float, generator: torch.Generator,
 ) -> Dict[str, torch.Tensor]:
-    """Build init vectors for sid tokens with no real learned codebook to ground them in.
+    """Build init vectors for sid tokens with no real learned codebook to ground them in (sid_start/sid_end/L3).
 
-    Used for sid_start, sid_end, and the L3 collision-disambiguation digit.
-    Independent random unit vectors, scaled to target_norm.
-
-    Exists because HF's default `resize_token_embeddings` turned out to be
-    worse than this simple fallback, both theoretically (per the GTI paper)
-    and empirically here: a smoke test measured sid_start and sid_end --
-    left at the default init -- landing at cosine similarity 0.9999997, i.e.
-    functionally the same vector, before this function existed. Independent
-    draws in a 1024-dim space are nearly orthogonal to each other with high
-    probability, which is what actually differentiates tokens.
+    Independent random unit vectors, scaled to target_norm -- nearly orthogonal
+    to each other with high probability in a high-dim space.
     """
     raw = torch.randn(len(tokens), hidden_size, generator=generator)
     unit = raw / raw.norm(dim=-1, keepdim=True)
@@ -187,25 +101,17 @@ def _sid_token_init_vectors(
 
 
 def _freeze_pretrained_vocab_gradient(model, original_vocab_size: int) -> None:
-    """Register a backward hook that zeros gradients on pretrained vocab rows.
+    """Register a backward hook that zeros gradients on pretrained vocab rows (< original_vocab_size).
 
-    Both the input and (if untied) output embedding weights get a hook that
-    zeroes rows < original_vocab_size. Only the newly added sid tokens
-    (rows >= original_vocab_size) ever receive a nonzero gradient.
-
-    Zeroing the gradient (rather than pursuing a real "only these rows are
-    Parameters" split, which isn't practical here given the frozen backbone
-    already needs the full matrix wrapped via modules_to_save/PEFT for
-    other reasons) also means AdamW's decoupled weight decay would still
-    silently shrink the "frozen" rows every step, since decoupled decay is
-    applied directly to the parameter and doesn't look at the gradient at
-    all -- that's why EmbeddingWarmupConfig.weight_decay defaults to 0.0.
+    Zeroing the gradient rather than splitting the parameter means AdamW's
+    decoupled weight decay would still silently shrink the "frozen" rows --
+    that's why EmbeddingWarmupConfig.weight_decay defaults to 0.0.
     """
     seen = set()
     for get_embeddings in (model.get_input_embeddings, model.get_output_embeddings):
         weight = get_embeddings().weight
         if id(weight) in seen:
-            continue  # tied embeddings -- same tensor, one hook is enough
+            continue
         seen.add(id(weight))
 
         def _mask_pretrained_rows(grad, original_vocab_size=original_vocab_size):
@@ -225,20 +131,13 @@ ALPACA_PROMPT = (
     "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
 )
 
-# Fixed probes for the live generation check, one per task type, covering
-# both directions of grounding since that's what completely failed before.
+# Fixed probes for the live generation check. None inputs are filled in at runtime from the dataset.
 GENERATION_PROBES = [
-    (
-        "What is the semantic ID for this game?",
-        "Half-Life 2",
-    ),
-    (
-        "A player enjoyed this game. Suggest another game they would likely also enjoy.",
-        None,  # filled in at runtime with a real semantic ID from the dataset
-    ),
+    ("What is the semantic ID for this game?", "Half-Life 2"),
+    ("A player enjoyed this game. Suggest another game they would likely also enjoy.", None),
     (
         "Given a user's game history, ordered from most to least played, predict the name of the next game they are likely to enjoy.",
-        None,  # filled in at runtime with a real multi-item history from the dataset
+        None,
     ),
 ]
 
@@ -254,65 +153,25 @@ class EmbeddingWarmupConfig:
     rqvae_checkpoint_path: Path = Path("checkpoints/rqvae_best.pt")
 
     base_model: str = "Qwen/Qwen3-0.6B"
-    # 4B (and any model too big to comfortably hold frozen weights in bf16
-    # alongside trainable embeddings) can load the frozen backbone in 4-bit
-    # -- embed_tokens/lm_head stay unquantized/trainable either way, since
-    # only Linear layers get bitsandbytes-wrapped, not the embedding table.
-    # lm_head is explicitly excluded too (llm_int8_skip_modules) since,
-    # despite being tied to embed_tokens, it's still its own nn.Linear that
-    # would otherwise get quantized separately and break the tie.
-    load_in_4bit: bool = False
+    load_in_4bit: bool = False  # for models too large to hold frozen in bf16 alongside trainable embeddings
     max_seq_length: int = 192
 
-    # Only a sample -- this stage is about giving the new tokens a sane
-    # starting point, not full convergence (that's Stage 2's job).
-    max_training_samples: int = 20000
-    # Restricts the sample to grounding_id2name/grounding_name2id (title<->
-    # sid pairs) instead of all 7 task types. Matches STAR's (arXiv,
-    # "Semantic-ID Token-Embedding Alignment for Generative Recommenders")
-    # alignment-stage design directly -- their ablation shows the gain comes
-    # specifically from item title/description<->Semantic-ID supervision,
-    # not from broader task exposure, so mixing in sequential/similar_item/
-    # nl_preference examples here dilutes the one signal this stage actually
-    # needs. Stage 2's full SFT run still covers every task normally.
-    grounding_only: bool = True
+    max_training_samples: int = 20000  # a sample, not full convergence -- Stage 2 does that
+    grounding_only: bool = True  # restrict to grounding_id2name/grounding_name2id (title<->sid pairs)
 
-    # High LR relative to normal fine-tuning (Stage 2 uses 2e-4): the only
-    # trainable parameters are the two embedding matrices, freshly
-    # initialized for 1026 tokens, so they need to move fast.
-    learning_rate: float = 1e-3
-    # Was 16 with grad_accum=1. Full-sequence loss (completion_only_loss=
-    # False) computes logits/loss over every position, not just the
-    # completion -- unlike completion-only loss, this can't skip masked-out
-    # positions, so it costs meaningfully more memory. Measured: batch=16
-    # alone hit ~5.5GB allocated / ~7.65GB reserved on step 1 of this 12GB
-    # GPU, close enough to the ceiling that Windows' silent GPU-memory
-    # "shared" fallback kicked in and turned ~1.3s steps into 20-150s+
-    # steps. Smaller micro-batch + gradient accumulation keeps the same
-    # effective batch size (16) at a fraction of the peak memory.
+    learning_rate: float = 1e-3  # high relative to normal fine-tuning: only 2 freshly-initialized matrices train
     micro_batch_size: int = 4
     gradient_accumulation_steps: int = 4
     max_steps: int = 750
     warmup_steps: int = 50
-    # Was 0.01. Decoupled AdamW weight decay is applied to every parameter
-    # directly, independent of its gradient -- so even with the pretrained
-    # vocabulary's rows gradient-masked to zero (see
-    # _freeze_pretrained_vocab_gradient), nonzero weight decay would still
-    # shrink them a little every step. Nothing in this stage should touch
-    # the pretrained vocabulary at all, so decay is off entirely rather
-    # than relying on the (tiny) effect being negligible.
-    weight_decay: float = 0.0
+    weight_decay: float = 0.0  # nonzero decay would still shrink the gradient-masked "frozen" rows
     lr_scheduler_type: str = "cosine"
     optimizer: str = "adamw_torch"
     logging_steps: int = 10
     generation_check_steps: int = 150
     seed: int = 0
 
-    # None (default) keeps the original behavior: no intermediate
-    # checkpoints, only the final save_pretrained() call. Set both to
-    # inspect progress at multiple points along a longer run instead of
-    # only the final state.
-    save_steps: Optional[int] = None
+    save_steps: Optional[int] = None  # None = no intermediate checkpoints, only the final save_pretrained()
     save_total_limit: int = 3
 
     def __post_init__(self):
@@ -323,14 +182,10 @@ class EmbeddingWarmupConfig:
             self.special_tokens_path = self.data_dir / "output" / "sft_special_tokens.json"
 
         if self.load_in_4bit and self.save_steps is None:
-            # The quantized path's final save is a known-broken no-op (see
-            # train()) -- periodic checkpointing is the ONLY way a run's
-            # result survives. Without this, a completed run would leave
-            # nothing to recover.
             raise ValueError(
                 "load_in_4bit=True requires save_steps to be set -- the "
-                "final save is skipped for quantized runs (see train()'s "
-                "docstring), so periodic checkpoints are the only output."
+                "final save is skipped for quantized runs (see train()), "
+                "so periodic checkpoints are the only output."
             )
 
         logger.info(
@@ -399,25 +254,11 @@ class EmbeddingWarmupTrainer:
         return tokens
 
     def load_model(self):
-        """Load base model + tokenizer, add sid tokens, init their weights, and make them trainable.
-
-        Returns:
-            (model, tokenizer) pair ready for SFTTrainer.
-        """
+        """Load base model + tokenizer, add sid tokens, init their weights, and make them trainable. Returns (model, tokenizer)."""
         cfg = self.config
         special_tokens = self._load_special_tokens()
 
         if cfg.load_in_4bit:
-            # Plain transformers + bitsandbytes + peft hit an unresolved
-            # dtype bug here: every individual piece (quantized loading,
-            # resize, custom init, PEFT wrapping, even generate() itself)
-            # worked in isolation, but failed once run through the real
-            # SFTTrainer -- pointing at a Trainer/accelerate internals
-            # interaction, not our code. Unsloth maintains hand-tested
-            # patches for exactly this scenario (quantized backbone + newly
-            # added trainable vocab), and it's the same combination
-            # eugeneyan's reference project used successfully for the same
-            # Stage 1 purpose.
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=cfg.base_model,
                 max_seq_length=cfg.max_seq_length,
@@ -435,10 +276,6 @@ class EmbeddingWarmupTrainer:
             tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
             model = AutoModelForCausalLM.from_pretrained(cfg.base_model, dtype=torch.bfloat16)
 
-            # Captured before resizing -- the target norm new tokens get
-            # rescaled to, so they start in the same magnitude range as the
-            # rest of the vocabulary instead of the RQ-VAE codebook's native
-            # (much smaller, near-zero) norm range.
             existing_norm_mean = model.get_input_embeddings().weight.norm(dim=-1).mean().item()
 
             original_vocab_size = len(tokenizer)
@@ -446,9 +283,6 @@ class EmbeddingWarmupTrainer:
             model.resize_token_embeddings(len(tokenizer))
             logger.info("Added %d special tokens; vocab size now %d", num_added, len(tokenizer))
 
-        # Explicit consistency check -- cheap insurance against exactly the
-        # class of tied-embeddings/dimension-mismatch bug already hit once
-        # in this project (see finetune_qwen.py's git history).
         vocab_size = len(tokenizer)
         input_size = model.get_input_embeddings().weight.shape[0]
         output_size = model.get_output_embeddings().weight.shape[0]
@@ -459,12 +293,6 @@ class EmbeddingWarmupTrainer:
             )
         logger.info("Verified vocab_size == input_embeddings == output_embeddings == %d", vocab_size)
 
-        # Overwrite HF's default mean/covariance random init for all 1026 new
-        # sid tokens -- codebook-grounded where a real RQ-VAE vector exists
-        # (768 L0-L2 tokens), distinct random vectors elsewhere (sid_start,
-        # sid_end, L3) since the default was measured to collapse them into
-        # a near-degenerate cluster. See _sid_token_init_vectors and the
-        # module docstring.
         init_vectors = _sid_token_init_vectors(
             cfg.rqvae_checkpoint_path, model.config.hidden_size, existing_norm_mean, cfg.seed,
         )
@@ -476,16 +304,9 @@ class EmbeddingWarmupTrainer:
         logger.info("Applied grounded/distinct initialization to %d sid tokens", len(init_vectors))
 
         if cfg.load_in_4bit:
-            # transformers' Trainer refuses to fine-tune a quantized model
-            # unless it's wrapped in a PeftModel, even though the only
-            # parameters we actually want trainable (embed_tokens/lm_head)
-            # were never quantized in the first place (only Linear layers
-            # get bitsandbytes-wrapped). modules_to_save does the real work
-            # here, identically to the non-quantized path below; target_modules
-            # is a single rank-1 adapter purely to satisfy peft's API (it
-            # requires at least one LoRA target) -- negligible next to the
-            # ~391M-parameter embedding matrix, so this stays effectively
-            # embedding-only, matching this stage's actual intent.
+            # transformers' Trainer requires a PeftModel to fine-tune a quantized model, even
+            # though embed_tokens/lm_head were never quantized; target_modules is a negligible
+            # rank-1 placeholder purely to satisfy peft's API -- modules_to_save does the real work.
             model = FastLanguageModel.get_peft_model(
                 model,
                 r=1, lora_alpha=1, target_modules=["q_proj"],
@@ -499,28 +320,15 @@ class EmbeddingWarmupTrainer:
             model.get_input_embeddings().weight.requires_grad = True
             model.get_output_embeddings().weight.requires_grad = True
 
-        # Both branches above make the WHOLE embedding matrix trainable
-        # (modules_to_save clones the entire module; requires_grad=True on
-        # the whole weight does the same directly) -- not just the new sid
-        # rows. Left alone, every ordinary vocabulary token that appears in
-        # a training example's prompt (i.e. almost all of them, under
-        # full-sequence loss) gets a real gradient update too, perturbing
-        # the pretrained vocabulary's embeddings during this stage's
-        # unusually high LR. STAR (arXiv, "Semantic-ID Token-Embedding
-        # Alignment for Generative Recommenders") makes this exact point --
-        # their alignment stage explicitly freezes the pretrained vocabulary
-        # and updates only the new Semantic-ID rows. Registering a
-        # gradient-masking hook here gets the same guarantee without giving
-        # up the modules_to_save/full-matrix-requires_grad mechanics both
-        # branches need for other reasons (PEFT's API, tied-embedding
-        # bookkeeping).
+        # Both branches above make the WHOLE embedding matrix trainable, not just the new sid
+        # rows; this masks the gradient so only the new rows actually update.
         _freeze_pretrained_vocab_gradient(model, original_vocab_size)
 
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         logger.info("Trainable parameters: %d / %d (%.4f%%)", trainable, total, 100 * trainable / total)
 
-        model.config.use_cache = False  # required for training even without gradient checkpointing here
+        model.config.use_cache = False
 
         self.model, self.tokenizer = model, tokenizer
         return model, tokenizer
@@ -538,12 +346,8 @@ class EmbeddingWarmupTrainer:
 
         full_dataset = load_dataset("json", data_files={"train": cfg.train_path.as_posix()})["train"]
 
-        # Captured from the FULL (unfiltered) dataset, even when
-        # grounding_only restricts the actual training sample below --
-        # sequential/asy examples won't exist in a grounding-only sample,
-        # but the generation-check probe still wants one real example of
-        # that shape to show whether the (untrained, in this stage) task
-        # looks sane or not.
+        # Captured from the full (unfiltered) dataset since grounding_only would otherwise
+        # exclude any sequential/asy example the generation-check probe wants to show.
         self._sample_history = next(ex["input"] for ex in full_dataset if ex["task"] in ("sequential", "asy"))
 
         dataset = full_dataset
@@ -578,20 +382,9 @@ class EmbeddingWarmupTrainer:
             save_total_limit=cfg.save_total_limit,
             report_to=[],
             seed=cfg.seed,
-            # Loss over the full sequence (prompt + completion), not just the
-            # completion -- matches eugeneyan's recipe. Sid tokens get
-            # gradient signal every time they appear, including on the
-            # prompt side, which matters most here since this stage's whole
-            # job is maximizing exposure for the freshly-initialized tokens.
-            completion_only_loss=False,
+            completion_only_loss=False,  # sid tokens get gradient signal on the prompt side too
         )
 
-        # Fill in a real semantic ID for the second probe (similar_item-
-        # shaped) and a real multi-item history for the third (asy-shaped)
-        # now that the dataset is loaded. sample_history comes from
-        # load_dataset's unfiltered pass (see its docstring note) since
-        # grounding_only means no sequential/asy examples survive in
-        # `dataset` itself.
         sample_id = next(ex["output"] for ex in dataset if "<|sid_start|>" in ex["output"])
         probe_fallbacks = [sample_id, self._sample_history]
         probes = []
@@ -619,24 +412,12 @@ class EmbeddingWarmupTrainer:
         trainer.train()
 
         if self.config.load_in_4bit:
-            # merge_and_unload() doesn't actually clear bitsandbytes'
-            # quantization bookkeeping on the frozen backbone (only q_proj
-            # had a LoRA delta to merge -- everything else stays a 4-bit
-            # Params4bit tensor under the hood), so save_pretrained()
-            # afterward hits a NotImplementedError in transformers'
-            # revert_weight_conversion, deep in code neither this project
-            # nor Unsloth controls. Don't attempt it: the trainer's own
-            # periodic checkpointing already saves a complete, working
-            # adapter checkpoint (proven -- that's what recovered a real
-            # run after this exact save crashed at the very end). Stage 2
-            # loads that adapter directly instead of expecting a merged,
-            # standalone checkpoint.
+            # merge_and_unload() leaves stale bitsandbytes quantization metadata that breaks
+            # save_pretrained(); the trainer's own periodic checkpoints are the valid output instead.
             logger.info(
-                "Quantized run: skipping merge+save (known-broken, see "
-                "module comments). The trainer's last periodic checkpoint "
-                "under %s/checkpoint-* is the complete, valid Stage 1 "
-                "result -- point Stage 2 at that adapter checkpoint "
-                "directly, not at %s itself.",
+                "Quantized run: skipping merge+save (known-broken). The trainer's last periodic "
+                "checkpoint under %s/checkpoint-* is the complete, valid Stage 1 result -- point "
+                "Stage 2 at that adapter checkpoint directly, not at %s itself.",
                 self.config.output_dir, self.config.output_dir,
             )
             return

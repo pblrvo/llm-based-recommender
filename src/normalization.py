@@ -18,12 +18,7 @@ class L2NormalizationLayer(nn.Module):
     """nn.Module wrapper around `l2norm`."""
 
     def __init__(self, dim=-1, eps=1e-12):
-        """Store the normalization axis and epsilon.
-
-        Args:
-            dim: Axis to normalize over. Defaults to -1 (the last axis).
-            eps: Small constant added to the denominator for numerical stability.
-        """
+        """Store the normalization axis and epsilon."""
         super().__init__()
         self.dim = dim
         self.eps = eps

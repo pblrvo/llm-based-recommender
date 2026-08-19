@@ -1,8 +1,4 @@
-"""Learning-rate schedule with an optional linear warmup phase.
-
-Used by train_rqvae.py; not a torch.optim.lr_scheduler subclass since it's
-simpler to drive from a manual step loop and to log/checkpoint directly.
-"""
+"""Learning-rate schedule with an optional linear warmup phase."""
 
 import math
 
@@ -31,17 +27,7 @@ class WarmupCosineScheduler:
         warmup_start_lr: float = 0.0,
         scheduler_type: str = "cosine_with_warmup",
     ):
-        """Configure the schedule and set the optimizer's initial LR.
-
-        Args:
-            optimizer: torch optimizer whose param_groups' `lr` will be updated.
-            total_steps: Total number of training steps (warmup + decay).
-            max_lr: Peak learning rate.
-            min_lr: Floor learning rate at the end of decay.
-            warmup_steps: Linear-warmup length; ignored when scheduler_type != "cosine_with_warmup".
-            warmup_start_lr: LR at step 0 of the warmup.
-            scheduler_type: "cosine" or "cosine_with_warmup".
-        """
+        """Configure the schedule and set the optimizer's initial LR."""
         if scheduler_type not in VALID_SCHEDULER_TYPES:
             raise ValueError(f"Unknown scheduler_type: {scheduler_type!r}, expected one of {VALID_SCHEDULER_TYPES}")
 
@@ -66,11 +52,9 @@ class WarmupCosineScheduler:
     def _compute_lr(self, step: int) -> float:
         """Compute the LR for a given step index."""
         if self.warmup_steps > 0 and step < self.warmup_steps:
-            # Linear warmup
             progress = step / self.warmup_steps
             return self.warmup_start_lr + progress * (self.max_lr - self.warmup_start_lr)
 
-        # Cosine decay over the post-warmup steps
         decay_steps = max(1, self.total_steps - self.warmup_steps)
         progress = min(1.0, (step - self.warmup_steps) / decay_steps)
         cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
@@ -100,12 +84,7 @@ class WarmupCosineScheduler:
         return {"step_count": self._step_count}
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore the step counter and immediately re-apply the corresponding LR.
-
-        Re-applies the LR for the restored step right away; otherwise the
-        optimizer keeps whatever LR was set at construction time (e.g.
-        warmup_start_lr) until the next .step() call.
-        """
+        """Restore the step counter and immediately re-apply the corresponding LR."""
         self._step_count = state["step_count"]
         self._set_lr(self._compute_lr(self._step_count))
         logger.info("Resumed LR scheduler at step %d, lr=%.2e", self._step_count, self._last_lr)

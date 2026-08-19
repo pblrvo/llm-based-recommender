@@ -18,16 +18,7 @@ logger = Logger.get_logger(__name__)
 
 
 class QuantizationOutput(NamedTuple):
-    """Bundle of tensors returned by `VectorQuantizer.forward`.
-
-    Attributes:
-        quantized_st: Forward-pass output with straight-through gradients.
-        quantized: The nearest codebook vectors (no gradient through codes).
-        indices: Integer code indices into the codebook, one per level position.
-        loss: Combined codebook + commitment loss.
-        codebook_loss: Distance from encoder output to chosen code (codebook update target).
-        commitment_loss: Distance from code to encoder output (encoder update target).
-    """
+    """Bundle of tensors returned by `VectorQuantizer.forward`: STE output, chosen codes, indices, and losses."""
 
     quantized_st: Tensor
     quantized: Tensor
@@ -41,22 +32,15 @@ class VectorQuantizer(nn.Module):
     """Single-level vector quantizer with codebook usage tracking and dead-code reset."""
 
     def __init__(self, config: RQVAEConfig):
-        """Set up the codebook and usage-tracking buffers.
-
-        Args:
-            config: RQVAEConfig supplying codebook_size, codebook_embedding_dim,
-                and commitment_weight.
-        """
+        """Set up the codebook and usage-tracking buffers."""
         super().__init__()
         self.codebook_embedding_dim = config.codebook_embedding_dim
         self.codebook_size = config.codebook_size
         self.commitment_weight = config.commitment_weight
 
-        # Learnable codebook
         self.embedding = nn.Embedding(self.codebook_size, self.codebook_embedding_dim)
         self.embedding.weight.data.uniform_(-1 / self.codebook_size, 1 / self.codebook_size)
 
-        # Track codebook usage
         self.register_buffer("usage_count", torch.zeros(self.codebook_size))
         self.register_buffer("update_count", torch.tensor(0))
 
@@ -74,28 +58,20 @@ class VectorQuantizer(nn.Module):
     def rotation_trick(u: Tensor, q: Tensor, e: Tensor) -> Tensor:
         """Apply the rotation-trick straight-through estimator from arXiv:2410.06424.
 
-        Args:
-            u: Unit vector from encoder output (normalized x).
-            q: Unit vector from quantized output (normalized quantized).
-            e: Original encoder output (x).
-
-        Returns:
-            Rotated encoder output that equals `q` in the forward pass but carries
-            gradients with respect to `e`.
+        Returns a rotated version of encoder output `e` that equals `q` in the
+        forward pass but carries gradients with respect to `e`.
         """
         w = l2norm(u + q, dim=-1, eps=1e-6).detach()
 
-        # Reshape for batch matrix multiplication
         w_col = w.unsqueeze(-1)
         w_row = w.unsqueeze(-2)
         u_col = u.unsqueeze(-1).detach()
         q_row = q.unsqueeze(-2).detach()
 
-        # For 2D input, add temporary batch dimension
         if e.ndim == 2:
-            e_expanded = e.unsqueeze(1)  # [B, D] -> [B, 1, D]
+            e_expanded = e.unsqueeze(1)
             result = e_expanded - 2 * (e_expanded @ w_col @ w_row) + 2 * (e_expanded @ u_col @ q_row)
-            return result.squeeze(1)  # [B, 1, D] -> [B, D]
+            return result.squeeze(1)
         else:
             return e - 2 * (e @ w_col @ w_row).squeeze(-1) + 2 * (e @ u_col @ q_row).squeeze(-1)
 
@@ -103,32 +79,21 @@ class VectorQuantizer(nn.Module):
     def rotate_to(src: Tensor, tgt: Tensor) -> Tensor:
         """Apply the rotation-trick STE so the model can learn through the VQ layer.
 
-        Args:
-            src: Source tensor (encoder output).
-            tgt: Target tensor (quantized output).
-
-        Returns:
-            Rotated tensor that equals `tgt` in the forward pass but has gradients
-            with respect to `src`.
+        Returns a tensor that equals `tgt` in the forward pass but carries
+        gradients with respect to `src`.
         """
-        # Flatten to 2D for processing
         orig_shape = src.shape
         src_flat = src.reshape(-1, src.shape[-1])
         tgt_flat = tgt.reshape(-1, tgt.shape[-1])
 
-        # Get norms
         norm_src = src_flat.norm(dim=-1, keepdim=True)
         norm_tgt = tgt_flat.norm(dim=-1, keepdim=True)
 
-        # Apply rotation in normalized space
         rotated_tgt = VectorQuantizer.rotation_trick(
             VectorQuantizer.safe_div(src_flat, norm_src), VectorQuantizer.safe_div(tgt_flat, norm_tgt), src_flat
         )
 
-        # Scale to match target norm
         rotated = rotated_tgt * VectorQuantizer.safe_div(norm_tgt, norm_src).detach()
-
-        # Reshape back
         return rotated.reshape(orig_shape)
 
     def find_nearest_codes(self, x: Tensor) -> Tuple[Tensor, Tensor]:
@@ -136,7 +101,6 @@ class VectorQuantizer(nn.Module):
         input_shape = x.shape
         flat_x = x.reshape(-1, self.codebook_embedding_dim)
 
-        # Calculate distances to all codebook vectors
         distances = torch.cdist(flat_x, self.embedding.weight)
         indices = distances.argmin(dim=1)
         quantized = self.embedding(indices).view(input_shape)
@@ -144,17 +108,7 @@ class VectorQuantizer(nn.Module):
         return indices.view(input_shape[:-1]), quantized
 
     def quantize(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        """Look up the nearest codebook vectors without computing losses or updating usage stats.
-
-        Use for inference/initialization paths (see forward() for the training path,
-        which tracks usage and returns gradients via the straight-through estimator).
-
-        Args:
-            x: Continuous input vectors.
-
-        Returns:
-            (indices, quantized vectors) tuple.
-        """
+        """Look up the nearest codebook vectors without computing losses or updating usage stats."""
         return self.find_nearest_codes(x)
 
     def update_usage(self, indices: Tensor):
@@ -170,13 +124,7 @@ class VectorQuantizer(nn.Module):
         return (self.usage_count > 0).float().mean().item()
 
     def get_max_usage_share(self) -> float:
-        """Return the share of all usage claimed by the single most-used code.
-
-        A healthy, well-distributed codebook keeps this close to 1/codebook_size.
-        A value near 1.0 means one code is doing almost all the work (index
-        collapse) even though get_usage_rate() may still look fine, since that
-        only checks whether codes were used *at all*, not how evenly.
-        """
+        """Return the share of all usage claimed by the single most-used code."""
         total = self.usage_count.sum()
         if total == 0:
             return 0.0
@@ -187,24 +135,13 @@ class VectorQuantizer(nn.Module):
         self.usage_count.zero_()
 
     def forward(self, x: Tensor) -> QuantizationOutput:
-        """Quantize `x` to the nearest codebook entries, returning losses and STE-propagated output.
-
-        Args:
-            x: Continuous input vectors.
-
-        Returns:
-            QuantizationOutput holding the STE output, the chosen codes, indices,
-            and the combined + component losses.
-        """
-        # Find nearest codebook vectors
+        """Quantize `x` to the nearest codebook entries, returning losses and STE-propagated output."""
         indices, quantized = self.find_nearest_codes(x)
 
-        # Compute losses
         commitment_loss = F.mse_loss(quantized.detach(), x)
         codebook_loss = F.mse_loss(quantized, x.detach())
         loss = codebook_loss + self.commitment_weight * commitment_loss
 
-        # Straight-through estimator for gradients
         if self.training:
             quantized_st = VectorQuantizer.rotate_to(x, quantized)
         else:
@@ -228,27 +165,11 @@ class VectorQuantizer(nn.Module):
         )
 
     def reset_unused_codebook_vectors(self, batch_data: Tensor, dominance_threshold: float = None):
-        """Reinit dead or over-dominant codebook entries from current batch vectors.
-
-        Index collapse can happen either way: a code nobody picks is wasted
-        capacity, but so is a code that ends up serving almost every input
-        while the rest of the codebook goes idle -- the latter is invisible to
-        get_usage_rate() (that code still counts as "used"), so it needs its
-        own check via dominance_threshold.
-
-        Args:
-            batch_data: Current batch's residual at this level, used as a
-                source of fresh vectors for whichever codes get reset.
-            dominance_threshold: If a code's share of usage exceeds this
-                (0-1), it is reset too. None or >=1.0 disables this check.
-        """
+        """Reinit dead or over-dominant codebook entries from current batch vectors."""
         if self.update_count == 0:
             return
 
-        # Dead codes: never picked at all.
         unused_indices = (self.usage_count == 0).nonzero().squeeze(-1)
-
-        # Over-dominant codes: picked far more than a fair share.
         dominant_indices = unused_indices.new_empty(0)
         total_usage = self.usage_count.sum()
         if dominance_threshold is not None and dominance_threshold < 1.0 and total_usage > 0:
@@ -259,7 +180,6 @@ class VectorQuantizer(nn.Module):
         if len(reset_indices) > 0:
             batch_flat = batch_data.reshape(-1, self.codebook_embedding_dim)
             if batch_flat.shape[0] >= len(reset_indices):
-                # Sample random vectors from batch
                 random_indices = torch.randperm(batch_flat.shape[0], device=batch_flat.device)[: len(reset_indices)]
                 self.embedding.weight.data[reset_indices] = batch_flat[random_indices].detach()
                 logger.info(
@@ -272,5 +192,4 @@ class VectorQuantizer(nn.Module):
                     len(reset_indices), batch_flat.shape[0],
                 )
 
-        # Reset usage count after replacement
         self.reset_usage_count()

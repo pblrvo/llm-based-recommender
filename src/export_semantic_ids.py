@@ -32,16 +32,7 @@ class SemanticIdExporter:
         batch_size: int = None,
         disambiguate_collisions: bool = True,
     ):
-        """Configure the exporter.
-
-        Args:
-            config: RQVAEConfig used to instantiate the model.
-            checkpoint_path: Trained RQ-VAE checkpoint to load.
-            output_path: Destination parquet; defaults to config.data_dir/output/semantic_ids.parquet.
-            device: Force a specific device; auto-detected when None.
-            batch_size: Items per encoding batch; defaults to config.batch_size.
-            disambiguate_collisions: If True, append a per-group disambiguator digit.
-        """
+        """Configure the exporter."""
         self.config = config
         self.checkpoint_path = Path(checkpoint_path)
         self.output_path = Path(output_path) if output_path else config.data_dir / "output" / "semantic_ids.parquet"
@@ -96,14 +87,7 @@ class SemanticIdExporter:
         return torch.cat(all_semantic_ids, dim=0).numpy()
 
     def report_collisions(self, semantic_ids: np.ndarray) -> int:
-        """Log how many items share an identical semantic ID with at least one other item.
-
-        A collision means an LLM trained on these IDs cannot tell the affected
-        items apart without extra disambiguation.
-
-        Returns:
-            Number of items involved in any collision.
-        """
+        """Log how many items share an identical semantic ID with at least one other item; return that count."""
         n_items = semantic_ids.shape[0]
         _, counts = np.unique(semantic_ids, axis=0, return_counts=True)
         n_unique_items = (counts == 1).sum()
@@ -122,13 +106,7 @@ class SemanticIdExporter:
         return n_colliding_items
 
     def add_collision_digit(self, semantic_ids: np.ndarray) -> np.ndarray:
-        """Append a per-group disambiguation digit to make every full ID unique.
-
-        Within each colliding group (items with identical values across all
-        quantization levels), items are numbered 0, 1, 2, ... in their
-        original order. This guarantees every row's full ID (levels +
-        disambiguator) is unique, at the cost of one extra token per item.
-        """
+        """Append a per-group disambiguation digit (0, 1, 2, ...) so every full ID is unique."""
         n = semantic_ids.shape[0]
         disambiguator = np.zeros(n, dtype=semantic_ids.dtype)
         seen_counts = {}

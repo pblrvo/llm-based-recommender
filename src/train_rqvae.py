@@ -43,16 +43,7 @@ class RQVAETrainer:
         checkpoint_every: int = 500,
         histogram_every: int = 100,
     ):
-        """Configure device, logging paths, and evaluation/checkpoint intervals.
-
-        Args:
-            config: RQVAEConfig holding model + training hyperparameters.
-            device: Force a specific device; auto-detected when None.
-            tensorboard_dir: TensorBoard log root. Defaults to runs/rqvae_<timestamp>.
-            val_every: Run validation every N epochs.
-            checkpoint_every: Save a numbered checkpoint every N epochs.
-            histogram_every: Log weight histograms every N epochs.
-        """
+        """Configure device, logging paths, and evaluation/checkpoint intervals."""
         self.config = config
         self.device = device or get_device()
         self.tensorboard_dir = Path(tensorboard_dir) if tensorboard_dir else (
@@ -133,14 +124,7 @@ class RQVAETrainer:
     # ------------------------------------------------------------------
 
     def train_step(self, batch: torch.Tensor) -> dict:
-        """Run one training step: forward, backward, clip, optimizer, scheduler, optional codebook reset.
-
-        Args:
-            batch: A single training batch of embeddings.
-
-        Returns:
-            Dict of scalar metrics for logging.
-        """
+        """Run one training step: forward, backward, clip, optimizer, scheduler, optional codebook reset."""
         self.model.train()
         batch = batch.to(self.device)
 
@@ -148,7 +132,6 @@ class RQVAETrainer:
         _, all_indices, loss_dict = self.model(batch)
         loss_dict["loss"].backward()
 
-        # Always compute the grad norm (even with clipping off) so it can be logged.
         max_norm = self.config.gradient_clip_norm if self.config.use_gradient_clipping else float("inf")
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
 
