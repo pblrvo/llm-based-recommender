@@ -76,9 +76,9 @@ real LoRA adapter (rank 8) across all attention/MLP projections on top of Stage 
 embeddings.
 
 The Stage 1 codebook-grounded init is informed by STAR (arXiv 2604.02324, "Semantic-ID
-Token-Embedding Alignment for Generative Recommenders") — see `src/warmup_embeddings.py`'s
-module docstring for the four layered fixes (codebook-grounded init, full-sequence loss,
-gradient-masked pretrained vocab, grounding-only sample) and the experiments that drove them.
+Token-Embedding Alignment for Generative Recommenders") — see `src/warmup_embeddings.py` for the
+four layered fixes this stage applies: codebook-grounded init, full-sequence loss, gradient-masked
+pretrained vocab, and a grounding-only training sample.
 
 ## Constrained decoding & eval
 
