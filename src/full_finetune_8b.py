@@ -1,38 +1,6 @@
-"""Stage 2 (full-parameter fine-tune) for the Qwen3-8B RunPod run -- same
-rebalanced-data recipe as qlora_finetune.py, but every parameter is
-trainable instead of a rank-8 LoRA adapter over a 4-bit base.
-
-Feasible here specifically because the token budget is small: ~396K
-examples at a measured mean of 64 tokens/example (well under the 192-token
-cap) is ~24M tokens/epoch, ~48M for 2 epochs -- full fine-tuning an 8B model
-over that little data is affordable on a single 80GB GPU with an 8-bit
-optimizer, unlike this project's original 12GB local GPU (which forced
-QLoRA for even a 4B model). Full fine-tuning is preferred over QLoRA here,
-not just tolerated: teaching ~1,000 new semantic-ID tokens real grounding
-across every layer is exactly the kind of representation shift a low-rank
-adapter is limited in reshaping, and full-parameter updates should converge
-more completely.
-
-Loads Stage 1's output directly (see warmup_embeddings.py's `load_in_4bit=
-False` path -- the one this script's Stage 1 uses for the same reason: 8B
-fits unquantized). Unlike qlora_finetune.py, Stage 1's checkpoint here is
-already a complete, plain HF model (extended vocab, warmed-up embeddings) --
-not a PEFT adapter -- so there's no embedding-tensor-copying step required,
-just load it and unfreeze every parameter.
-
-Learning rate (2e-5) matches this project's own prior full-parameter
-precedent (see qlora_finetune.py's docstring: "was 2e-5 for full_finetune.
-py's full-parameter updates", from an earlier Qwen3-0.6B full fine-tune).
-Optimizer is 8-bit AdamW (bitsandbytes, already a project dependency) --
-the lever that keeps 8B full fine-tuning inside a single 80GB GPU's memory
-instead of needing multi-GPU FSDP.
-
-Batch size was smoke-tested on the actual RunPod A100 80GB PCIe (see
-FullFineTuneConfig.micro_batch_size) -- micro_batch=8/grad_accum=16 measured
-at ~58GB/82GB steady-state, ~7.5-8s/optimizer step. Observed throughput
-(~914 tok/s at micro_batch=4; better at micro_batch=8) is well under naive
-FLOP-based estimates -- if re-estimating training time/cost, use the
-measured per-step timing here, not a theoretical tok/s figure.
+"""Stage 2 (full-parameter fine-tune) for the Qwen3-8B RunPod run: loads
+Stage 1's warmed-up model and trains every parameter (unlike qlora_finetune.py's
+rank-8 LoRA adapter), using an 8-bit AdamW optimizer to fit a single 80GB GPU.
 """
 
 from dataclasses import dataclass
@@ -59,12 +27,6 @@ GENERATION_PROBES = [
 class FullFineTuneConfig:
     """Configuration for the Stage 2 full-parameter fine-tune on Qwen3-8B."""
 
-    # Stage 1's output directory (see warmup_embeddings.py, load_in_4bit=
-    # False path) -- a complete model, not an adapter, since the non-
-    # quantized path never wraps with PEFT. Point this at Stage 1's actual
-    # output dir, e.g. outputs/qwen3-8b-embed-warmup (its final
-    # save_pretrained(), not a numbered checkpoint -- unlike the 4-bit path,
-    # the plain path's final save is NOT a known-broken no-op).
     stage1_model_path: Path = Path("outputs/qwen3-8b-embed-warmup")
     data_dir: Path = Path("data")
     train_path: Optional[Path] = None
@@ -72,47 +34,26 @@ class FullFineTuneConfig:
     output_dir: Path = Path("outputs/qwen3-8b-full-finetune")
     max_seq_length: int = 192
 
-    # Effective batch = micro_batch_size * gradient_accumulation_steps.
-    # Smoke-tested on the actual RunPod A100 80GB PCIe: micro_batch=4 used
-    # 54GB/82GB steady-state at ~9s/optimizer step; micro_batch=8 (this
-    # config) used 58GB/82GB (71%, still comfortable headroom) at a steadier
-    # ~7.5-8s/step -- ~13% faster for the same effective batch, so worth the
-    # extra ~4GB. Both were measured with gradient_checkpointing=True.
-    micro_batch_size: int = 8
-    gradient_accumulation_steps: int = 16  # effective batch 128, matching this project's existing convention
+    micro_batch_size: int = 8  # effective batch = micro_batch_size * gradient_accumulation_steps
+    gradient_accumulation_steps: int = 16
     num_epochs: int = 2
-    max_steps: Optional[int] = None  # None -> num_epochs drives training length (budget allows full epochs now)
-    learning_rate: float = 2e-5  # full-parameter LR, matches this project's own prior full_finetune.py precedent
+    max_steps: Optional[int] = None
+    learning_rate: float = 2e-5
     warmup_ratio: float = 0.03
-    optimizer: str = "paged_adamw_8bit"  # bitsandbytes 8-bit Adam -- keeps this fitting a single 80GB GPU
+    optimizer: str = "paged_adamw_8bit"
     weight_decay: float = 0.01
     lr_scheduler_type: str = "cosine"
-    gradient_checkpointing: bool = True  # trades compute for memory -- every layer is trainable here, unlike LoRA
+    gradient_checkpointing: bool = True
     save_steps: int = 300
     save_total_limit: int = 5
     eval_steps: int = 300
-    # Periodic in-training eval only needs to catch divergence early, not
-    # replace the real evaluation -- run_full_finetune_8b.py's run_eval()
-    # already runs the full, rigorous constrained-beam-search eval once
-    # training finishes. Matches evaluate_ranking_metrics.py's own n=500
-    # convention (there, 500 *per task*; here, 500 total, since this is
-    # just a coarse loss/accuracy trend signal). A smoke test measured the
-    # full 25,202-example val set taking ~6 min per eval pass -- at
-    # eval_steps=300 across a 2-epoch run that's ~19 passes, ~1.9 hours of
-    # pure eval overhead for no extra signal over a small sample.
-    eval_sample_size: int = 500
+    eval_sample_size: int = 500  # in-training eval subsample; run_eval() does the full post-training eval
     logging_steps: int = 10
     generation_check_steps: int = 300
     seed: int = 0
     resume_from_checkpoint: Optional[str] = None
 
-    # None (default) skips the push entirely -- set to a real repo id (e.g.
-    # "pblrvo/Qwen3-8B-Game-semantic-IDs-v3") to upload the final model
-    # after training. Requires a Hugging Face token with write access to be
-    # available (HF_TOKEN env var, or a prior `huggingface-cli login`) --
-    # checked at the START of train(), before the multi-hour run, not after
-    # it -- a bad/missing token should fail fast, not surface only once
-    # there's a finished model with nowhere to put it.
+    # None skips the Hugging Face push entirely; otherwise a repo id to upload the final model to.
     hf_repo_id: Optional[str] = None
 
     def __post_init__(self):
@@ -182,11 +123,7 @@ class FullFineTuneTrainer:
         self.tokenizer = None
 
     def load_model(self):
-        """Load Stage 1's complete model/tokenizer and unfreeze every parameter.
-
-        Returns:
-            (model, tokenizer) pair ready for SFTTrainer.
-        """
+        """Load Stage 1's complete model/tokenizer and unfreeze every parameter. Returns (model, tokenizer)."""
         cfg = self.config
         stage1_path = cfg.stage1_model_path.resolve().as_posix()
 
@@ -194,15 +131,12 @@ class FullFineTuneTrainer:
         model = AutoModelForCausalLM.from_pretrained(stage1_path, dtype=torch.bfloat16)
         logger.info("Loaded Stage 1 model from %s (vocab size %d)", stage1_path, len(tokenizer))
 
-        # Stage 1 leaves everything but embed_tokens/lm_head frozen
-        # (requires_grad=False) -- undo that here, this stage trains every
-        # parameter.
         for param in model.parameters():
             param.requires_grad = True
 
         if cfg.gradient_checkpointing:
             model.gradient_checkpointing_enable()
-        model.config.use_cache = False  # required for training, doubly so with gradient checkpointing
+        model.config.use_cache = False
 
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
@@ -272,7 +206,7 @@ class FullFineTuneTrainer:
             logging_steps=cfg.logging_steps,
             report_to=["tensorboard"],
             seed=cfg.seed,
-            completion_only_loss=False,  # matches Stage 1 and qlora_finetune.py's full-sequence loss
+            completion_only_loss=False,
         )
 
         sample_id = next(
@@ -298,12 +232,7 @@ class FullFineTuneTrainer:
         )
 
     def _check_hf_auth(self):
-        """Fail fast if hf_repo_id is set but no valid write-access token is available.
-
-        Checked before training starts, not after -- a missing/bad token
-        should be caught in seconds, not discovered only once there's a
-        finished model with nowhere to push it.
-        """
+        """Fail fast if hf_repo_id is set but no valid write-access token is available."""
         from huggingface_hub import HfApi
 
         try:

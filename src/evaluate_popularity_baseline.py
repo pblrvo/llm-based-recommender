@@ -1,25 +1,12 @@
 """Popularity baseline for the same tasks/metrics as evaluate_ranking_metrics.py:
 "always recommend the globally most popular items, ignoring the input
 entirely" -- the sanity check every recommender should beat before its
-Recall@K/NDCG@K numbers mean anything. Beating random chance only shows
-the model learned *something*; beating this baseline shows it's actually
-conditioning on the input rather than defaulting to popular answers -- exactly
-the failure mode this project's dataset rebalancing was built to prevent (see
-build_finetune_dataset.py's module docstring).
+Recall@K/NDCG@K numbers mean anything. No model/GPU involved.
 
 Popularity is computed from raw item occurrence counts in
-data/clean_user_sequences.parquet -- NOT from SFT training-example target
-frequency. That distinction matters: build_finetune_dataset.py's
-train_val_split_by_group sends each item's *entire* example group to either
-train or val, never both, so train-set target frequency and val-set targets
-are structurally disjoint (verified: zero overlap between train/val targets
-for `sequential`) -- a popularity baseline built from SFT train targets would
-score exactly 0% by construction, regardless of how good or bad it actually
-is. Raw sequence-occurrence counts don't have this problem since they're
-independent of the SFT dataset's split entirely.
-
-No model/GPU involved: reuses the identical recall_at_k/ndcg_at_k functions
-evaluate_ranking_metrics.py uses, for a directly comparable number.
+data/clean_user_sequences.parquet, not from SFT training-example target
+frequency -- the latter would score exactly 0% by construction, since
+train/val targets are structurally disjoint by group.
 """
 
 import json
@@ -51,10 +38,7 @@ def load_examples_by_task(path: Path) -> Dict[str, List[dict]]:
 
 
 def most_popular_items(project_root: Path, k: int) -> List[int]:
-    """Return the k item ids with the most total occurrences across all user sequences.
-
-    True global popularity, independent of the SFT dataset's train/val split.
-    """
+    """Return the k item ids with the most total occurrences across all user sequences."""
     sequences_df = pl.read_parquet(project_root / "data" / "clean_user_sequences.parquet")
     counts = Counter()
     for row in sequences_df.iter_rows(named=True):
@@ -80,23 +64,14 @@ def evaluate_task(val_sample: List[dict], popular_candidates: List[str]) -> Dict
 
 
 def run(project_root: Path, n: int = 500, seed: int = 0) -> Dict[str, Dict[int, Dict[str, float]]]:
-    """Run the popularity baseline on every task and return per-task, per-K metrics.
-
-    Args:
-        project_root: Repository root containing `data/`.
-        n: Number of val examples sampled per task.
-        seed: RNG seed used to sample val examples.
-
-    Returns:
-        Nested dict {task: {k: {recall, ndcg}}}.
-    """
+    """Run the popularity baseline on every task and return per-task, per-K metrics."""
     val_by_task = load_examples_by_task(project_root / "data" / "output" / "sft_val.jsonl")
 
     catalog = load_catalog(project_root)
     sid_by_id = {row["id"]: semantic_id_to_tokens(row["semantic_ids"]) for row in catalog.iter_rows(named=True)}
     desc_by_id = {row["id"]: item_description(row["Name"], row["Genres"]) for row in catalog.iter_rows(named=True)}
 
-    popular_item_ids = most_popular_items(project_root, k=max(K_VALUES) * 2)  # headroom in case some ids lack catalog metadata
+    popular_item_ids = most_popular_items(project_root, k=max(K_VALUES) * 2)
     popular_sids = [sid_by_id[i] for i in popular_item_ids if i in sid_by_id][: max(K_VALUES)]
     popular_descs = [desc_by_id[i] for i in popular_item_ids if i in desc_by_id][: max(K_VALUES)]
     logger.info("Top-%d globally popular items (by raw sequence occurrence): %s", max(K_VALUES), popular_item_ids[: max(K_VALUES)])

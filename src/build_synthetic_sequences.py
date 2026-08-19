@@ -1,37 +1,9 @@
 """Generates synthetic user sequences to top up under-exposed items for the
-sequential task, so the model sees more (history, target) pairs teaching the
-semantic-ID structure for items real user data barely covers.
-
-Approach: a temperature-weighted random walk over a k-NN graph built from
-item embeddings (already computed in games_with_embeddings.parquet). Walking
-between embedding-neighbors is a proxy for walking between items that share
-RQ-VAE codebook prefixes (semantic-ID structure), since the quantizer was
-trained to put similar embeddings in the same codes -- so these synthetic
-sequences reinforce prefix-sharing = meaning-sharing for items real sequences
-don't repeat enough to teach that from.
-
-Targeted top-up only: an item's real target frequency (how often it appears
-as a non-first position in a real sequence, matching sequential's own floor
-logic) is measured, and synthetic sequences are generated only for items
-below `target_floor`, just enough to reach it -- not a blanket multiplier.
-
-Output is schema-compatible with clean_user_sequences.parquet (same
-item_sequence / playtime_sequence / is_long_tail_user columns), tagged with
-an extra is_synthetic column. main() writes both the synthetic-only file and
-a combined (real + synthetic) file ready to hand to build_finetune_dataset.py
-as --sequences-path.
-
-Every synthetic row gets a placeholder positive playtime (there's no real
-playtime to report), so build_finetune_dataset.py's `_played_sequence`
-filter -- which drops zero-playtime items -- doesn't discard them. Synthetic
-rows are excluded from `_compute_similar_partners`'s co-occurrence
-computation there: injecting embedding-walk-derived co-occurrence into
-similar_item would be circular, since those walks are themselves built from
-embedding similarity -- it would launder manufactured data as if it were
-independent evidence of real similarity. Only sequential/asy, whose
-under-exposure problem this script targets, consume synthetic rows.
-build_finetune_dataset.py also keeps every synthetic-tagged example out of
-val (see build_all()), so eval only ever measures real user behavior.
+sequential task: a temperature-weighted random walk over a k-NN graph built
+from item embeddings, targeted at items below `target_floor`. Output is
+schema-compatible with clean_user_sequences.parquet, tagged with an extra
+is_synthetic column; main() writes both the synthetic-only file and a
+combined (real + synthetic) file for build_finetune_dataset.py.
 """
 
 import argparse
@@ -48,12 +20,7 @@ logger = Logger.get_logger(__name__)
 
 
 def played_sequence(row: dict, interacted_ids: set) -> list:
-    """Item IDs from `row`, restricted to played (nonzero playtime) catalog items.
-
-    Mirrors AlpacaDatasetBuilder._played_sequence -- kept as a free function
-    here since this script runs standalone, before build_finetune_dataset.py
-    ever loads the combined file.
-    """
+    """Item IDs from `row`, restricted to played (nonzero playtime) catalog items."""
     return [
         item_id
         for item_id, playtime in zip(row["item_sequence"], row["playtime_sequence"])
@@ -62,13 +29,7 @@ def played_sequence(row: dict, interacted_ids: set) -> list:
 
 
 def load_real_frequencies(sequences_df: pl.DataFrame, interacted_ids: set) -> collections.Counter:
-    """Count how often each item appears as a target position (index >= 1) in a real sequence.
-
-    Matches sequential's own floor logic (see build_finetune_dataset.py's
-    _build_history_target_pairs), which only ever sees played items -- an
-    item under-exposed only because most of its plays were zero-playtime
-    noise shouldn't get synthetic top-up it doesn't actually need.
-    """
+    """Count how often each item appears as a target position (index >= 1) in a real sequence."""
     counts = collections.Counter()
     for row in sequences_df.iter_rows(named=True):
         if row["is_long_tail_user"]:
@@ -78,6 +39,7 @@ def load_real_frequencies(sequences_df: pl.DataFrame, interacted_ids: set) -> co
 
 
 def build_knn(embeddings: np.ndarray, k: int) -> NearestNeighbors:
+    """Fit a k-NN index over the item embeddings using cosine distance."""
     nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
     nn.fit(embeddings)
     return nn
@@ -106,6 +68,7 @@ def walk_to_target(
 
 
 def main():
+    """CLI entry point: build the k-NN graph, walk to under-exposed items, and write the synthetic + combined files."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-floor", type=int, default=5, help="Match sequential_target_floor.")
     parser.add_argument("--k", type=int, default=15, help="Neighbors per item in the k-NN graph.")
@@ -170,10 +133,7 @@ def main():
             walk_ids = [item_ids[i] for i in walk_idx]
             synthetic_rows.append({
                 "item_sequence": walk_ids,
-                # Placeholder: no real playtime to report, but must be
-                # positive or _played_sequence's zero-playtime filter would
-                # discard the very items this script exists to top up.
-                "playtime_sequence": [1] * len(walk_ids),
+                "playtime_sequence": [1] * len(walk_ids),  # placeholder positive playtime
                 "is_long_tail_user": False,
             })
 
@@ -192,8 +152,7 @@ def main():
     combined_path = output_path.parent / "combined_user_sequences.parquet"
     combined_df.write_parquet(combined_path)
     logger.info(
-        "Wrote %d combined sequences (%d real + %d synthetic) to %s -- "
-        "point build_finetune_dataset.py's sequences_path at this file to include the top-up",
+        "Wrote %d combined sequences (%d real + %d synthetic) to %s",
         len(combined_df), len(real_tagged), len(synthetic_df), combined_path,
     )
 

@@ -1,36 +1,16 @@
-"""Recall@K / NDCG@K for the fine-tuned model's recommendation-shaped
-tasks, computed via constrained beam search rather than a single greedy
-decode.
+"""Recall@K / NDCG@K for the fine-tuned model's recommendation-shaped tasks,
+computed via constrained beam search (generate K candidates restricted to
+real catalog items, score like a traditional recommender's top-K list),
+matching TIGER (Rajput et al. 2023) and LC-Rec (Zheng et al. 2023)'s eval
+methodology for generative retrieval.
 
-A single greedy generation is a top-1 prediction, not a ranking, so plain
-exact-match (used elsewhere in this project's eval tooling) can't be
-compared against classic RecSys baselines' Recall@K/NDCG@K. The standard
-fix in the generative-retrieval-for-recsys literature -- TIGER (Rajput et
-al. 2023, "Recommender Systems with Generative Retrieval") and LC-Rec
-(Zheng et al. 2023, arXiv 2311.09049, the paper this project's `asy` task
-is drawn from) -- is constrained beam search: generate K candidates
-restricted to real catalog items via the same trie used for constrained
-decoding elsewhere in this project, then score them exactly like a
-traditional recommender's top-K ranked list. Beam search stands in for the
-ranking step a dot-product-over-all-items model gets for free.
-
-Covers the tasks with a well-defined "one correct target" ranking question:
-  - grounding_name2id / sequential / similar_item / nl_similar_item: rank
-    candidate semantic IDs via the sid_trie.
-  - grounding_id2name / asy: rank candidate name+genres(+blurb)
-    descriptions via the name_trie (which accepts both the short
-    "Name — Genres" form asy targets and the blurb-enriched long form
-    grounding_id2name targets -- see build_name_trie), then score via
-    `name_lookup` -- both the candidates and the target are mapped down to
-    just the item's plain Name before recall_at_k/ndcg_at_k, so the metric
-    asks "did it predict the correct game" rather than requiring an exact
-    match on genres/blurb text too.
-
-nl_preference is a different kind of question -- many items can validly
-satisfy an open-ended query like "an action game", so there's no single
-stored target to check recall against. It's scored with
-criteria_satisfied_at_k/criteria_ndcg_at_k instead (genre/category
-consistency of the top-k candidates), not recall_at_k/ndcg_at_k.
+grounding_name2id/sequential/similar_item/nl_similar_item rank candidate
+semantic IDs via the sid_trie. grounding_id2name/asy rank candidate
+name+genres(+blurb) descriptions via the name_trie, then score via
+name_lookup (both candidate and target collapsed to plain item Name).
+nl_preference has no single correct target -- it's scored with
+criteria_satisfied_at_k/criteria_ndcg_at_k (genre/category consistency)
+instead of recall_at_k/ndcg_at_k.
 """
 
 import json
@@ -70,52 +50,22 @@ TASK_TRIES = {
     "asy": "name",
     "nl_preference": "sid",
 }
-# Tasks scored via name_lookup (candidate/target collapsed to plain item
-# Name before recall_at_k/ndcg_at_k) rather than raw exact-match -- both
-# produce name+genres(+blurb) text, not a single-token-family output like
-# the sid tasks, so "predicted the correct game" is the meaningful
-# question, not exact string equality on the full description.
+# Tasks scored via name_lookup (candidate/target collapsed to plain item Name) rather than raw exact-match.
 NAME_ONLY_TASKS = {"grounding_id2name", "asy"}
 K_VALUES = [5, 10]
-# 32 (evaluate_task's default) is exactly right for the 6-token sid outputs
-# but far too small for name_trie targets once grounding_id2name includes
-# a blurb -- measured up to ~90+ tokens for name+genres+blurb. See
-# evaluate_task's docstring for why too-small a value here silently
-# produces unmatchable (truncated-before-any-trie-END) candidates rather
-# than just shorter ones.
+# 32 (evaluate_task's default) fits the 6-token sid outputs but is too small for
+# name_trie targets once grounding_id2name includes a blurb (~90+ tokens).
 NAME_TASK_MAX_NEW_TOKENS = 96
-# Diverse beam search was tried for the name_trie tasks (motivation: plain
-# beam search collapses onto one franchise -- see constrained_beam_search's
-# docstring) and made things categorically worse, not better. Measured with
-# num_beam_groups=10 (one beam per group, maximum diversity) at
-# diversity_penalty=1.0: generation degenerated into a repeated single
-# character (`""""""..."`) on every sampled example. With one beam per
-# group there is no within-group search at all -- each group is penalized
-# against every other group's token choice at that position, and on this
-# constrained trie the model's natural next token kept losing that penalty
-# competition, falling into whatever low-probability trie-valid token was
-# still unpenalized. Left at num_beam_groups=1 (plain beam search) as a
-# result; a milder configuration (fewer groups, lower penalty) might still
-# help but needs its own small-scale validation before spending eval time
-# on it again, exactly like NAME_TASK_MAX_NEW_TOKENS and the pad-token fix
-# each were validated at small n before being trusted at n=500.
+# Diverse beam search was tried as a fix for the name_trie's beam collapse (see
+# constrained_beam_search's docstring) and made things categorically worse across
+# every config tested (probe_diverse_beam.py) -- degenerates into repeated garbage
+# tokens regardless of num_beam_groups/diversity_penalty. Left at plain beam search.
 NAME_TASK_BEAM_GROUPS = 1
 NAME_TASK_DIVERSITY_PENALTY = 1.0
 
 
 def load_model(adapter_path: Path):
-    """Load a fine-tuned model for eval, auto-detecting adapter vs. full-parameter format.
-
-    `adapter_path` may point at either:
-      - a QLoRA adapter directory (has adapter_config.json) -- reattached to
-        a fresh 4-bit BASE_MODEL_NAME, the original qlora_finetune.py path.
-      - a complete full-parameter fine-tuned model directory (no
-        adapter_config.json, e.g. full_finetune_8b.py's output) -- loaded
-        directly, no base model or quantization involved.
-
-    Returns:
-        (model, tokenizer) pair, ready for `eval()`.
-    """
+    """Load a fine-tuned model for eval, auto-detecting a QLoRA adapter vs. a full-parameter model dir."""
     tokenizer = AutoTokenizer.from_pretrained(adapter_path)
 
     if (Path(adapter_path) / "adapter_config.json").exists():
@@ -130,12 +80,8 @@ def load_model(adapter_path: Path):
         model = PeftModel.from_pretrained(base_model, adapter_path)
         logger.info("Model + adapter loaded from %s", adapter_path)
     else:
-        # device_map="cuda" matters here -- unlike the 4-bit branch above
-        # (bitsandbytes quantization implicitly requires and places on
-        # CUDA), plain from_pretrained() defaults to CPU. Missing this
-        # silently ran constrained_beam_search entirely on CPU (0% GPU
-        # utilization, ~58s/example instead of GPU speed) on the actual
-        # RunPod eval run.
+        # device_map="cuda" is required here -- unlike the 4-bit branch, plain
+        # from_pretrained() defaults to CPU and silently runs eval there.
         model = AutoModelForCausalLM.from_pretrained(adapter_path, dtype=torch.bfloat16, device_map="cuda")
         logger.info("Full-parameter model loaded from %s", adapter_path)
 
@@ -160,28 +106,9 @@ def evaluate_task(
 ) -> Dict[int, Dict[str, float]]:
     """Run constrained beam search over every example and return mean Recall@k/NDCG@k per K.
 
-    `result_lookup`, if given, maps each candidate and the target through it
-    before scoring -- e.g. build_name_lookup, which collapses a full
-    grounding_id2name description down to just the item's Name, so the
-    metric checks "predicted the correct game" rather than requiring an
-    exact match on genres/blurb text too. Entries missing from the lookup
-    are left as-is (defensive; every trie-constrained candidate and every
-    real target should already be present).
-
-    `max_new_tokens` (default 32) is plenty for the sid-output tasks -- a
-    semantic ID is always exactly 6 tokens -- but far too small for
-    grounding_id2name/asy's name+genres(+blurb) targets, which can run to
-    ~90+ tokens once the blurb is included. Too small a value here doesn't
-    just truncate the text -- it can cut generation off *before* the model
-    reaches any trie-valid stopping point, producing a candidate that
-    never matches any real catalog entry regardless of whether the model
-    "knew" the right answer. Callers evaluating a name_trie task should
-    pass a larger value (see run()).
-
-    `num_beam_groups`/`diversity_penalty` are likewise name_trie-only: plain
-    beam search over the description trie collapses all beams onto one
-    franchise, degenerating Recall@10 into Recall@1 (see
-    constrained_beam_search's docstring for the measurement).
+    `result_lookup`, if given, maps each candidate and the target through it before
+    scoring (e.g. build_name_lookup, to compare on plain item Name). `max_new_tokens`
+    and `num_beam_groups`/`diversity_penalty` matter for name_trie tasks -- see run().
     """
     per_k_recall = {k: [] for k in K_VALUES}
     per_k_ndcg = {k: [] for k in K_VALUES}
@@ -250,19 +177,7 @@ def run(
     adapter_path: Path, project_root: Path, n: int = 500, seed: int = 0, temperature: Optional[float] = None,
     source: str = "val",
 ) -> Dict[str, Dict[int, Dict[str, float]]]:
-    """Run Recall@K/NDCG@K evaluation for every task in TASK_TRIES.
-
-    Args:
-        adapter_path: LoRA adapter directory.
-        project_root: Repository root containing `data/`.
-        n: Examples sampled per task.
-        seed: RNG seed used to sample examples.
-        temperature: Beam-search sampling temperature; None means deterministic.
-        source: 'val' (default, held-out) or 'train' (diagnostic only).
-
-    Returns:
-        Nested dict {task: {k: {recall, ndcg}}}.
-    """
+    """Run Recall@K/NDCG@K evaluation for every task in TASK_TRIES. Returns {task: {k: {recall, ndcg}}}."""
     data_path = project_root / "data" / "output" / ("sft_train.jsonl" if source == "train" else "sft_val.jsonl")
     model, tokenizer = load_model(adapter_path)
 
@@ -327,7 +242,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--source", choices=["val", "train"], default="val",
-        help="'train' evaluates against seen training examples -- a diagnostic, not a real generalization metric (see run()'s docstring).",
+        help="'train' evaluates against seen training examples -- a diagnostic, not a generalization metric.",
     )
     args = parser.parse_args()
 

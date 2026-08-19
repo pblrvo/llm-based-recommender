@@ -21,18 +21,7 @@ class MLP(nn.Module):
             dropout: float = 0.0,
             normalize: bool = False,
     ) -> None:
-        """Build the MLP: `input_dim` -> `hidden_dim` -> ... -> `output_dim`.
-
-        Every intermediate layer is followed by ReLU (and optional Dropout);
-        the final output is either raw or L2-normalized, controlled by `normalize`.
-
-        Args:
-            input_dim: Size of the input feature dimension.
-            hidden_dim: Sizes of the hidden layers, in order.
-            output_dim: Size of the output feature dimension.
-            dropout: Dropout probability applied after each hidden activation. 0 disables it.
-            normalize: If True, L2-normalize the final output.
-        """
+        """Build the MLP: `input_dim` -> `hidden_dim` -> ... -> `output_dim`, each hidden layer followed by ReLU/Dropout."""
         super().__init__()
 
         self.input_dim = input_dim

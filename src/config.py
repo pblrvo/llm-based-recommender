@@ -23,35 +23,34 @@ class RQVAEConfig:
     checkpoint_dir: Path = Path("checkpoints")
 
     # Model parameters
-    item_embedding_dim: int = 1024  # Input embedding dimension (e.g., Qwen3-0.6B)
-    encoder_hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])  # Encoder layers
-    codebook_embedding_dim: int = 32  # Dimension of codebook vectors
-    codebook_quantization_levels: int = 3  # Number of hierarchical levels
-    codebook_size: int = 256  # Number of codes per codebook
-    codebook_normalize: bool = False  # L2-normalize encoder output before quantization
-    commitment_weight: float = 0.1  # Commitment loss weight (beta)
+    item_embedding_dim: int = 1024
+    encoder_hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
+    codebook_embedding_dim: int = 32
+    codebook_quantization_levels: int = 3
+    codebook_size: int = 256
+    codebook_normalize: bool = False
+    commitment_weight: float = 0.1  # beta
 
     # Training parameters
-    batch_size: int = 32768  # Batch size for training
-    gradient_accumulation_steps: int = 1  # Number of gradient accumulation steps
-    num_epochs: int = 20000  # Number of training epochs
-    scheduler_type: str = "cosine_with_warmup"  # Learning rate scheduler type ("cosine", "cosine_with_warmup")
-    warmup_start_lr: float = 1e-8  # Starting learning rate for warmup (only for cosine_with_warmup)
-    warmup_steps: int = 200  # Number of warmup steps (only for cosine_with_warmup)
-    max_lr: float = 3e-4  # Maximum learning rate (start of cosine)
-    min_lr: float = 1e-6  # Minimum learning rate (end of cosine)
-    use_gradient_clipping: bool = True  # Enable gradient clipping
-    gradient_clip_norm: float = 1.0  # Maximum gradient norm for clipping
-    use_kmeans_init: bool = True  # Use k-means initialization for codebooks
-    reset_unused_codes: bool = True  # Reset unused codebook codes during training
-    steps_per_codebook_reset: int = 2  # Reset unused codebook codes every N steps (breaks if set to 1)
-    codebook_usage_threshold: float = 1.0  # Only reset if usage falls below this proportion (0-1)
-    codebook_dominance_threshold: float = 0.5  # Also reset a code if it claims more than this share of usage
-    val_split: float = 0.05  # Validation set split ratio
+    batch_size: int = 32768
+    gradient_accumulation_steps: int = 1
+    num_epochs: int = 20000
+    scheduler_type: str = "cosine_with_warmup"  # "cosine" or "cosine_with_warmup"
+    warmup_start_lr: float = 1e-8  # only for cosine_with_warmup
+    warmup_steps: int = 200  # only for cosine_with_warmup
+    max_lr: float = 3e-4
+    min_lr: float = 1e-6
+    use_gradient_clipping: bool = True
+    gradient_clip_norm: float = 1.0
+    use_kmeans_init: bool = True
+    reset_unused_codes: bool = True
+    steps_per_codebook_reset: int = 2  # breaks if set to 1
+    codebook_usage_threshold: float = 1.0  # 0-1
+    codebook_dominance_threshold: float = 0.5
+    val_split: float = 0.05
 
     def __post_init__(self):
         """Validate configuration, fill in computed defaults, and log a summary."""
-        # Auto-generate embeddings path if not provided
         if self.embeddings_path is None:
             self.embeddings_path = self.data_dir / "output" / "games_with_embeddings.parquet"
             logger.info("embeddings_path not set, defaulting to %s", self.embeddings_path)

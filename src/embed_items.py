@@ -6,9 +6,7 @@ import time
 from pathlib import Path
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# Reduces allocator fragmentation from the widely varying batch sizes/shapes
-# produced by length-bucketed batching (see PyTorch's own OOM error message).
-# Not supported on Windows (CUDAAllocatorConfig warns and ignores it there).
+# Reduces allocator fragmentation from length-bucketed batching's varying batch shapes. Not supported on Windows.
 if sys.platform != "win32":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -28,15 +26,10 @@ MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 BATCH_SIZE = 64
 EMBED_DIM = 1024
 
-# Batch size is scaled down for longer sequences since attention memory grows
-# roughly with sequence length squared; BATCH_SIZE is only safe up to
-# REFERENCE_SEQ_LEN tokens.
+# BATCH_SIZE is only safe up to this many tokens; longer sequences use a smaller batch (attention cost ~ len^2).
 REFERENCE_SEQ_LEN = 512
 
-# How often (in seconds) to persist progress to disk. Embedding the full
-# catalog takes hours; without checkpoints, a crash near the end (e.g. an
-# OOM on the last few long-sequence batches) throws away everything.
-CHECKPOINT_INTERVAL_SECONDS = 300
+CHECKPOINT_INTERVAL_SECONDS = 300  # how often to persist progress to disk
 
 logger = Logger.get_logger(__name__)
 
@@ -70,52 +63,23 @@ def generate_embeddings(
         pretokenized_batch: dict,
         target_dim = 1024,
 ) -> np.ndarray:
-    """Run `model` over one pretokenized batch and return L2-normalized embeddings.
-
-    Args:
-        model: HuggingFace embedding model.
-        device: Device the model lives on.
-        pretokenized_batch: Dict with 'input_ids' and 'attention_mask' tensors.
-        target_dim: Truncate each embedding to this many dimensions; ignored if None.
-
-    Returns:
-        numpy array of shape [batch, target_dim] (float32, CPU).
-    """
-    # Move to device
+    """Run `model` over one pretokenized batch and return L2-normalized embeddings, shape [batch, target_dim]."""
     encoded = {k: v.to(device) for k, v in pretokenized_batch.items()}
 
-    # Generate embeddings
     with torch.no_grad():
         outputs = model(**encoded)
-
-        # Use last token pooling
         embeddings = last_token_pool(outputs.last_hidden_state, encoded["attention_mask"])
 
-        # Truncate to target dimension if specified
         if target_dim and target_dim < embeddings.shape[1]:
             embeddings = embeddings[:, :target_dim]
 
-        # L2 normalize
         embeddings = F.normalize(embeddings, p=2, dim=1)
 
     return embeddings.float().cpu().numpy()
 
 
 def generate_embeddings_with_oom_retry(model, device, batch: dict, target_dim: int) -> np.ndarray:
-    """Call `generate_embeddings`, halving the batch and retrying on CUDA OOM.
-
-    Safety net for cases where the adaptive batch size (calibrated on
-    REFERENCE_SEQ_LEN) still doesn't fit for a particular batch/GPU.
-
-    Args:
-        model: HuggingFace embedding model.
-        device: Device the model lives on.
-        batch: Pretokenized batch dict.
-        target_dim: Embedding truncation target dimension.
-
-    Returns:
-        numpy array of embeddings.
-    """
+    """Call `generate_embeddings`, halving the batch and retrying on CUDA OOM."""
     batch_size = batch["input_ids"].size(0)
     try:
         return generate_embeddings(model, device, batch, target_dim)
@@ -161,8 +125,6 @@ def _load_checkpoint(checkpoint_path: Path, total_items: int):
 
 def _save_checkpoint(checkpoint_path: Path, embeddings: np.ndarray, filled: np.ndarray, total_items: int):
     """Atomically save progress to `checkpoint_path` (write-temp + rename)."""
-    # Write to a temp file and rename, so a crash mid-write can't corrupt
-    # the last good checkpoint.
     tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
     with open(tmp_path, "wb") as f:
         np.savez(f, embeddings=embeddings, filled=filled, n_items=total_items)
@@ -171,23 +133,12 @@ def _save_checkpoint(checkpoint_path: Path, embeddings: np.ndarray, filled: np.n
 
 
 def embed_items(input_path: Path = None, output_path: Path = None, tokenized_path: Path = None, limit: int = None):
-    """CLI entry point: load the catalog + tokens, embed, and write embeddings to parquet.
-
-    Args:
-        input_path: Source catalog parquet. Defaults to DATA_DIR/clean_game_catalog.parquet.
-        output_path: Destination parquet. Defaults to DATA_DIR/output/games_with_embeddings.parquet.
-        tokenized_path: Pretokenized .npz from tokenize_items.py.
-        limit: If set, only embed the first `limit` items.
-
-    Returns:
-        DataFrame with the original catalog columns plus a new `embedding` column.
-    """
+    """CLI entry point: load the catalog + tokens, embed, and write embeddings to parquet. Returns the resulting DataFrame."""
     device = get_device()
     input_path = input_path or DATA_DIR / "clean_game_catalog.parquet"
     output_path = output_path or DATA_DIR / "output" / "games_with_embeddings.parquet"
     tokenized_path = tokenized_path or DATA_DIR / "tokenized_game_catalog.npz"
 
-    # Load data
     logger.info("Loading item catalog from %s", input_path)
     item_df = pl.read_parquet(input_path)
     if limit:
@@ -224,7 +175,6 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
 
     logger.info("Loading pre-tokenized data from %s", tokenized_path)
     with np.load(tokenized_path) as pretokenized_data:
-        # Verify data matches
         if pretokenized_data["n_items"] != total_items:
             logger.error(
                 "Item count mismatch: tokenized=%d, catalog=%d",
@@ -238,11 +188,7 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
         attention_mask = torch.from_numpy(pretokenized_data["attention_mask"])
     logger.info("Pre-tokenized data validated: %d items, padded sequence length %d", total_items, input_ids.shape[1])
 
-    # Real per-item token counts (excluding padding). Padded length is a fixed
-    # worst case (e.g. 2000), but most items are much shorter (see notebook
-    # EDA); since attention cost scales ~quadratically with sequence length,
-    # batching items of similar real length together and trimming each batch
-    # down to only what it needs avoids paying for padding on every batch.
+    # Real per-item token counts, used to batch similar-length items together and trim padding per batch.
     real_lengths = attention_mask.sum(dim=1)
     length_percentiles = torch.quantile(real_lengths.float(), torch.tensor([0.5, 0.9, 0.99]))
     logger.info(
@@ -251,7 +197,6 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
         real_lengths.max(), input_ids.shape[1],
     )
 
-    # Resume from a checkpoint if one exists (e.g. a previous run crashed).
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.parent / f"{output_path.stem}.checkpoint.npz"
     checkpoint = _load_checkpoint(checkpoint_path, total_items)
@@ -283,10 +228,8 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
                 "attention_mask": attention_mask[batch_positions, :batch_max_len],
             }
 
-            # Generate embeddings
             batch_embeddings = generate_embeddings_with_oom_retry(model, device, batch, EMBED_DIM)
 
-            # Write to pre-allocated array at each item's original position
             position_indices = batch_positions.numpy()
             all_embeddings[position_indices] = batch_embeddings
             filled[position_indices] = True
@@ -309,7 +252,6 @@ def embed_items(input_path: Path = None, output_path: Path = None, tokenized_pat
         total_items, elapsed, total_items / elapsed if elapsed else 0.0,
     )
 
-    # Add embeddings to dataframe
     embeddings_list = all_embeddings.tolist()
     items_df_with_emb = item_df.with_columns(pl.Series("embedding", embeddings_list, dtype=pl.List(pl.Float32)))
 

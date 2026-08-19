@@ -23,11 +23,7 @@ class RQVAE(nn.Module):
     """Encoder + residual-quantization stack + decoder producing semantic IDs and reconstructions."""
 
     def __init__(self, config: RQVAEConfig):
-        """Build the encoder, decoder, and stack of vector quantizers.
-
-        Args:
-            config: RQVAEConfig holding architecture and codebook settings.
-        """
+        """Build the encoder, decoder, and stack of vector quantizers."""
         super().__init__()
 
         self.config = config
@@ -38,19 +34,16 @@ class RQVAE(nn.Module):
         self.codebook_normalize = config.codebook_normalize
         self.codebook_size = config.codebook_size
 
-        # Build encoder
         self.encoder = MLP(
             self.item_embedding_dim, self.encoder_hidden_dims, self.codebook_embedding_dim,
             normalize=self.codebook_normalize,
         )
 
-        # Build decoder
         self.decoder = MLP(
             self.codebook_embedding_dim, self.encoder_hidden_dims[::-1], self.item_embedding_dim,
             normalize=False,
         )
 
-        # Quantization Layers
         self.vq_layers = nn.ModuleList([VectorQuantizer(config) for _ in range(self.codebook_quantization_levels)])
 
         n_params = sum(p.numel() for p in self.parameters())
@@ -69,43 +62,33 @@ class RQVAE(nn.Module):
         return self.decoder(x)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, List[Tensor], dict]:
-        """Encode, residual-quantize, and decode; return reconstruction, per-level indices, and a loss dict.
-
-        Args:
-            x: Input embedding batch.
-
-        Returns:
-            (x_recon, all_indices, loss_dict) where loss_dict contains the
-            total/recon/VQ losses, per-level codebook and commitment losses,
-            per-level input residuals (for codebook resets), and the final residual.
-        """
+        """Encode, residual-quantize, and decode; return reconstruction, per-level indices, and a loss dict."""
         z = self.encode(x)
 
-        # Residual quantization
         quantized_out = torch.zeros_like(z)
         residual = z
 
         all_indices = []
-        level_residuals = []  # Input residual to each level, before quantization (for codebook resets)
+        level_residuals = []
         vq_loss = 0
         codebook_losses = []
         commitment_losses = []
 
         for vq_layer in self.vq_layers:
             level_residuals.append(residual)
-            vq_output = vq_layer(residual)  # Quantize current residual
-            residual = residual - vq_output.quantized.detach()  # Update residual for next level
-            quantized_out = quantized_out + vq_output.quantized_st  # Accumulate quantized vectors
+            vq_output = vq_layer(residual)
+            residual = residual - vq_output.quantized.detach()
+            quantized_out = quantized_out + vq_output.quantized_st
             all_indices.append(vq_output.indices)
 
-            vq_loss = vq_loss + vq_output.loss  # Store indices and accumulate loss
-            if vq_output.codebook_loss is not None:  # Track individual loss components
+            vq_loss = vq_loss + vq_output.loss
+            if vq_output.codebook_loss is not None:
                 codebook_losses.append(vq_output.codebook_loss)
             commitment_losses.append(vq_output.commitment_loss)
 
-        x_recon = self.decode(quantized_out)  # Decode
-        recon_loss = F.mse_loss(x_recon, x)  # Reconstruction loss
-        loss = recon_loss + vq_loss  # Total loss
+        x_recon = self.decode(quantized_out)
+        recon_loss = F.mse_loss(x_recon, x)
+        loss = recon_loss + vq_loss
 
         logger.debug(
             "RQVAE forward: batch=%d, loss=%.4f, recon_loss=%.4f, vq_loss=%.4f",
@@ -117,25 +100,17 @@ class RQVAE(nn.Module):
             "loss": loss,
             "recon_loss": recon_loss,
             "vq_loss": vq_loss,
-            "codebook_losses": codebook_losses,  # List of losses per level (empty for EMA)
-            "commitment_losses": commitment_losses,  # List of losses per level
-            "indices": all_indices,  # Store for metric computation
-            "residual": residual,  # Store for residual norm calculation
-            "level_residuals": level_residuals,  # Per-level input, for codebook resets
+            "codebook_losses": codebook_losses,
+            "commitment_losses": commitment_losses,
+            "indices": all_indices,
+            "residual": residual,
+            "level_residuals": level_residuals,
         }
 
         return x_recon, all_indices, loss_dict
 
     def encode_to_semantic_ids(self, x: Tensor) -> Tensor:
-        """Encode `x` and return its hierarchical semantic IDs (no gradients).
-
-        Args:
-            x: Input embedding batch.
-
-        Returns:
-            Tensor of shape [batch, codebook_quantization_levels] with one
-            codebook index per level per item.
-        """
+        """Encode `x` and return its hierarchical semantic IDs (no gradients), shape [batch, levels]."""
         with torch.no_grad():
             z = self.encode(x)
             residual = z
@@ -146,20 +121,12 @@ class RQVAE(nn.Module):
                 indices_list.append(indices)
                 residual = residual - quantized
 
-            # Stack indices from all levels
             semantic_ids = torch.stack(indices_list, dim=-1)
         logger.info("Encoded %d items to semantic IDs (shape=%s)", x.shape[0], tuple(semantic_ids.shape))
         return semantic_ids
 
     def decode_from_semantic_ids(self, semantic_ids: Tensor) -> Tensor:
-        """Decode a batch of semantic IDs back into the original embedding space.
-
-        Args:
-            semantic_ids: Tensor of shape [batch, codebook_quantization_levels].
-
-        Returns:
-            Reconstructed embeddings of shape [batch, item_embedding_dim].
-        """
+        """Decode a batch of semantic IDs (shape [batch, levels]) back into the original embedding space."""
         with torch.no_grad():
             quantized_sum = torch.zeros(semantic_ids.shape[0], self.codebook_embedding_dim, device=semantic_ids.device)
 
@@ -172,33 +139,17 @@ class RQVAE(nn.Module):
         return decoded
 
     def calculate_unique_ids_proportion(self, semantic_ids: Tensor) -> float:
-        """Return the fraction of items in a batch with a unique semantic ID.
-
-        Args:
-            semantic_ids: Tensor of shape [batch_size, codebook_quantization_levels].
-
-        Returns:
-            Proportion of items with unique semantic IDs (0 to 1).
-        """
+        """Return the fraction of items in a batch with a unique semantic ID."""
         batch_size = semantic_ids.shape[0]
         if batch_size <= 1:
             return 1.0
 
-        # Compare all pairs of semantic IDs
-        # Shape: [batch_size, 1, codebook_quantization_levels] == [1, batch_size, codebook_quantization_levels]
-        ids_expanded_1 = semantic_ids.unsqueeze(1)  # [B, 1, L]
-        ids_expanded_2 = semantic_ids.unsqueeze(0)  # [1, B, L]
+        ids_expanded_1 = semantic_ids.unsqueeze(1)
+        ids_expanded_2 = semantic_ids.unsqueeze(0)
+        matches = (ids_expanded_1 == ids_expanded_2).all(dim=-1)
+        matches.fill_diagonal_(False)  # ignore self-matches
 
-        # Check which pairs are identical (all levels match)
-        matches = (ids_expanded_1 == ids_expanded_2).all(dim=-1)  # [B, B]
-
-        # Ignore self-matches (the diagonal); a duplicate is a match against
-        # ANY other item, whether it appears earlier or later in the batch.
-        matches.fill_diagonal_(False)
-
-        has_duplicate = matches.any(dim=1)  # [B]
-
-        # Count unique IDs (those that don't have duplicates)
+        has_duplicate = matches.any(dim=1)
         n_unique = (~has_duplicate).sum().item()
 
         return n_unique / batch_size
@@ -208,37 +159,15 @@ class RQVAE(nn.Module):
         return [vq_layer.get_usage_rate() for vq_layer in self.vq_layers]
 
     def calculate_codebook_max_share(self) -> List[float]:
-        """Return per-level single-code usage share.
-
-        Unlike calculate_codebook_usage(), this catches index collapse where
-        one code dominates while the rest are technically "used" at least
-        once. Close to 1/codebook_size is healthy; close to 1.0 is collapse.
-        """
+        """Return per-level single-code usage share (close to 1/codebook_size is healthy; close to 1.0 is collapse)."""
         return [vq_layer.get_max_usage_share() for vq_layer in self.vq_layers]
 
     def calculate_avg_residual_norm(self, residual: Tensor) -> float:
-        """Return the mean L2 norm of the per-item residual after quantization.
-
-        Args:
-            residual: Final residual tensor after all quantization levels.
-
-        Returns:
-            Average L2 norm of the residual.
-        """
+        """Return the mean L2 norm of the per-item residual after quantization."""
         return residual.norm(dim=-1).mean().item()
 
     def kmeans_init(self, data_loader, device):
-        """Initialize each codebook by running k-means on the first batch's residuals.
-
-        Runs sequentially through all levels: each level's codebook is seeded
-        with k-means cluster centers, then the next level's residual is
-        computed from those centers before its k-means runs.
-
-        Args:
-            data_loader: DataLoader yielding embedding batches.
-            device: Device the model is on; k-means centroids are copied here.
-        """
-        # Get first batch
+        """Initialize each codebook by running k-means on the first batch's residuals, level by level."""
         first_batch = next(iter(data_loader))
         if isinstance(first_batch, (list, tuple)):
             first_batch = first_batch[0]
@@ -250,21 +179,18 @@ class RQVAE(nn.Module):
         )
         init_start = time.perf_counter()
 
-        # Encode to latent space
         with torch.no_grad():
             z = self.encode(first_batch)
 
-            # Initialize each level's codebook
             residual = z
             for level, vq_layer in enumerate(self.vq_layers):
                 level_start = time.perf_counter()
-                residual_np = residual.cpu().numpy().reshape(-1, self.codebook_embedding_dim)  # Flatten for k-means
+                residual_np = residual.cpu().numpy().reshape(-1, self.codebook_embedding_dim)
 
                 kmeans = KMeans(n_clusters=self.codebook_size, n_init=10, random_state=0)
-                kmeans.fit(residual_np)  # Run k-means
+                kmeans.fit(residual_np)
 
-                # KMeans always returns float64 centers; cast to match the
-                # model's (float32) dtype, or later matmuls/cdist calls fail.
+                # KMeans returns float64 centers; cast to match the model's float32 dtype.
                 vq_layer.embedding.weight.data = torch.from_numpy(kmeans.cluster_centers_).float().to(device)
 
                 logger.info(
@@ -272,7 +198,7 @@ class RQVAE(nn.Module):
                     level + 1, self.codebook_quantization_levels, time.perf_counter() - level_start, kmeans.inertia_,
                 )
 
-                if level < self.codebook_quantization_levels - 1:  # Compute next residual
+                if level < self.codebook_quantization_levels - 1:
                     _, quantized = vq_layer.quantize(residual)
                     residual = residual - quantized
 

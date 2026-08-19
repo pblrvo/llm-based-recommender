@@ -23,16 +23,7 @@ class Logger:
 
     @classmethod
     def get_logger(cls, name: str, level: int = logging.INFO, log_file: Path = LOG_FILE) -> logging.Logger:
-        """Return a logger named `name`, configuring the root logger on first use.
-
-        Args:
-            name: Logger name (typically __name__ of the calling module).
-            level: Root logger level. Defaults to INFO.
-            log_file: File to tee log output to. Defaults to LOG_FILE.
-
-        Returns:
-            A logging.Logger that shares the root's console + file handlers.
-        """
+        """Return a logger named `name`, configuring the root logger on first use."""
         cls._configure_root(level, log_file)
         return logging.getLogger(name)
 

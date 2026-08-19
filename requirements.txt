@@ -25,13 +25,23 @@ peft==0.19.1
 bitsandbytes==0.49.2
 datasets==4.3.0
 safetensors==0.8.0
+# Used directly (not just as a transitive dep of transformers/datasets) by
+# full_finetune_8b.py's HF Hub push (`from huggingface_hub import HfApi`).
+huggingface_hub==1.22.0
+# triton isn't pinned here: it's optional (embed_items.py wraps `import
+# triton` in try/except and falls back to eager mode if it's missing) and,
+# when needed, comes bundled with a CUDA-enabled torch wheel on Linux --
+# see the top of this file for why torch itself is installed separately.
 
-# Notebooks (interactive_model_query.ipynb, evaluate_semantic_ids.ipynb) --
-# ipykernel lets a Jupyter frontend (VS Code, JupyterLab, etc.) run this
-# venv as a kernel; nbconvert additionally allows headless execution
-# (`jupyter nbconvert --to notebook --execute ...`) without one.
+# Notebooks. ipykernel lets a Jupyter frontend (VS Code, JupyterLab, etc.)
+# run this venv as a kernel; nbconvert additionally allows headless
+# execution (`jupyter nbconvert --to notebook --execute ...`) without one.
 ipykernel==7.3.0
 nbconvert==7.17.1
+# preprocess_australian_data.ipynb (Stage 0) only -- pandas isn't used
+# anywhere else in this project, which uses polars for everything past
+# Stage 0.
+pandas==3.0.4
 
 # Tests
 pytest==9.1.1

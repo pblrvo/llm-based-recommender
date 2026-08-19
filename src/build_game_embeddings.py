@@ -27,14 +27,7 @@ class GameEmbeddingPipeline:
         output_path: Path = None,
         limit: int = None,
     ):
-        """Configure file paths and an optional item-count limit.
-
-        Args:
-            input_path: Source catalog parquet. Defaults to DATA_DIR/clean_game_catalog.parquet.
-            tokenized_path: Pretokenized .npz destination. Defaults to DATA_DIR/tokenized_game_catalog.npz.
-            output_path: Embeddings parquet destination. Defaults to DATA_DIR/output/games_with_embeddings.parquet.
-            limit: If set, only process the first `limit` items.
-        """
+        """Configure file paths and an optional item-count limit."""
         self.input_path = input_path or DATA_DIR / "clean_game_catalog.parquet"
         self.tokenized_path = tokenized_path or DATA_DIR / "tokenized_game_catalog.npz"
         self.output_path = output_path or DATA_DIR / "output" / "games_with_embeddings.parquet"
